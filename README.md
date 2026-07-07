@@ -13,3 +13,9 @@ The specification is stored in [montauk spec](montauk_spec.md).
 The generators for the specification's test vectors (Section 13), including
 their validation against RFC 7748 and the official Noise test vectors, live
 in [reference/](reference/).
+
+# Reference Implementation
+
+The roadmap for the reference implementation — architecture, milestones,
+testing strategy, and the running spec-feedback log — is in
+[docs/reference_roadmap.md](docs/reference_roadmap.md).
