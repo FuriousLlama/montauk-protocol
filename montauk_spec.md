@@ -1,9 +1,9 @@
 ---
 title: "The Montauk Protocol"
 author: "Manuel Rodriguez (manuel.rodriguez@teknios.tech)"
-version: "0.1.0-draft"
+version: "0.2.0-draft"
 status: "Draft Specification"
-date: "2026-01-25"
+date: "2026-07-01"
 ---
 
 # The Montauk Protocol
@@ -43,7 +43,7 @@ Current internet architecture assumes static or discoverable network addresses. 
 - **Targeted attacks**: Known addresses enable focused denial-of-service and exploitation attempts
 - **Metadata exposure**: Connection endpoints reveal relationship information
 
-IPv6's vast address space (2^128 addresses) is typically viewed as an addressing solution. The Montauk Protocol repurposes this space as a security mechanism: by computing connection addresses from shared secrets, legitimate peers can find each other while unauthorized parties face an infeasible search space.
+IPv6's vast address space is typically viewed as an addressing solution. The Montauk Protocol repurposes it as a security mechanism: by computing connection addresses from shared secrets, legitimate peers can find each other while unauthorized parties face an infeasible search space. A host only controls the bits below its delegated routing prefix, but even confined to a single known /64 prefix, an attacker must search 2^64 addresses—each combined with roughly 2^16 candidate ports—per time bucket.
 
 ### 1.2 Design Goals
 
@@ -80,7 +80,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 ### 2.2 Definitions
 
-**Address Stream**: The sequence of (IPv6 address, port) tuples generated for a relationship over time.
+**Address Stream**: The sequence of (IPv6 address, port) tuples generated over time for one direction of a relationship (one party acting as responder).
 
 **Broker**: A server that facilitates connections between NAT-blocked participants.
 
@@ -97,6 +97,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Relationship**: A bidirectional association between two participants, comprising shared cryptographic material and configuration.
 
 **Responder**: The party accepting a connection.
+
+**Routing Prefix**: The high-order bits of a participant's IPv6 addresses, fixed by network delegation. Generated addresses vary only in the bits below the prefix.
 
 **Service**: An application endpoint accessible through a relationship.
 
@@ -269,17 +271,26 @@ HandshakePassword := BYTES[32]
 ### 5.4 Reachability
 
 ```
+IPv6Prefix := {
+    prefix: BYTES[16],    # High `length` bits significant, remaining bits zero
+    length: UINT8         # Prefix length P in bits (0-128)
+}
+
 Reachability := {
-    type: UINT8,          # 0x01 = DIRECT, 0x02 = BROKERED
+    type: UINT8,                       # 0x01 = DIRECT, 0x02 = BROKERED
+    prefix: IPv6Prefix | NULL,         # Participant's routing prefix (DIRECT)
     broker_pubkey: PublicKey | NULL,
+    broker_prefix: IPv6Prefix | NULL,  # Broker's routing prefix (BROKERED)
     broker_guest_prior: Prior | NULL
 }
 ```
 
-| Type Value | Meaning                                         |
-| ---------- | ----------------------------------------------- |
-| 0x01       | DIRECT - Participant has globally routable IPv6 |
-| 0x02       | BROKERED - Participant uses a broker            |
+| Type Value | Meaning                                         | Required Fields                                  |
+| ---------- | ----------------------------------------------- | ------------------------------------------------ |
+| 0x01       | DIRECT - Participant has globally routable IPv6 | prefix                                           |
+| 0x02       | BROKERED - Participant uses a broker            | broker_pubkey, broker_prefix, broker_guest_prior |
+
+The routing prefix constrains address generation (Section 6.3): generated addresses must fall within a prefix that actually routes to the responder.
 
 ### 5.5 Service Definition
 
@@ -350,13 +361,16 @@ session_key = HKDF-SHA256(
 
 ### 6.3 Address Computation
 
+A host does not control all 128 bits of its IPv6 address: the high bits are fixed by its delegated routing prefix, and only the bits below the prefix are locally assignable. Addresses are therefore generated within the responder's advertised prefix (Section 5.4).
+
 For a given time bucket T:
 
 ```
-input = T || ADDRESS_INFO
+input = T || ADDRESS_INFO || responder_pubkey
 raw = HMAC-SHA256(session_key, input)
 
-ipv6_address = raw[0:16]
+suffix = raw[0:16] AND NOT prefix_mask(P)
+ipv6_address = responder_prefix OR suffix
 port_raw = (raw[16] << 8) | raw[17]
 port = PORT_MIN + (port_raw mod PORT_RANGE)
 ```
@@ -365,9 +379,14 @@ Where:
 
 - `T` is encoded as UINT64 big-endian (8 bytes)
 - `ADDRESS_INFO` is the UTF-8 encoding of "montauk-v1-address"
+- `responder_pubkey` is the static public key (32 bytes) of the party that will accept the connection; its inclusion gives each direction of a relationship an independent address stream (Section 6.5)
 - `||` denotes concatenation
-- `raw[0:16]` is the first 16 bytes
-- `raw[16]` and `raw[17]` are individual bytes
+- `responder_prefix` is the responder's advertised routing prefix: 16 bytes with all bits below the prefix length set to zero
+- `P` is the advertised prefix length in bits; `prefix_mask(P)` is the 128-bit mask with the high P bits set
+- `AND`, `OR`, `NOT` are bitwise operations over 128 bits
+- `raw[0:16]` is the first 16 bytes; `raw[16]` and `raw[17]` are individual bytes
+
+The responder MUST ensure the advertised prefix actually routes to it (typically by advertising the /64 of the network segment the Montauk Server occupies). A shorter prefix leaves more derived bits and therefore a larger unauthorized search space (Section 11.2).
 
 ### 6.4 Address Window
 
@@ -376,9 +395,9 @@ To accommodate clock drift, implementations SHOULD maintain a window of valid ad
 ```
 current_T = T(now)
 valid_addresses = [
-    compute_address(session_key, current_T - 1),
-    compute_address(session_key, current_T),
-    compute_address(session_key, current_T + 1)
+    compute_address(session_key, responder_pubkey, responder_prefix, current_T - 1),
+    compute_address(session_key, responder_pubkey, responder_prefix, current_T),
+    compute_address(session_key, responder_pubkey, responder_prefix, current_T + 1)
 ]
 ```
 
@@ -386,20 +405,35 @@ This provides tolerance of ±BUCKET_DURATION seconds (±5 minutes with default s
 
 ### 6.5 Directionality
 
-Address computation is symmetric—both parties compute the same address. The **responder** binds to computed addresses; the **initiator** connects to them.
+The session key (Section 6.2) is symmetric, but address computation is role-separated: the responder's static public key is part of the HMAC input, and the resulting address lies within that responder's routing prefix. Each direction of a relationship therefore has an independent address stream. The **responder** binds to addresses from its own stream; the **initiator** connects to them.
 
 For bidirectional relationships where either party may initiate:
 
-- Each party computes addresses for their role as responder
-- Each party connects to the peer's addresses when initiating
+- Each party binds to the address stream derived from its own public key and prefix (its role as responder)
+- Each party connects to the peer's address stream when initiating
+
+Without this role separation, both directions would derive identical (address, port) values from the symmetric session key and collide.
 
 ---
 
 ## 7. Message Formats
 
-### 7.1 First Packet
+### 7.1 Framing
 
-The initial packet from initiator to responder:
+All protocol messages are carried over the transport stream as length-prefixed frames:
+
+```
+Frame := {
+    length: UINT16,       # Body length in bytes, big-endian
+    body: BYTES[length]
+}
+```
+
+One frame carries exactly one message: the FirstPacket, a Noise handshake message, or a Noise transport message. Noise messages are at most 65535 bytes, so any message fits in a single frame. Receivers MUST NOT process a frame body until `length` bytes have been received.
+
+### 7.2 First Packet
+
+The initial message from initiator to responder, carried as the body of the first frame:
 
 ```
 FirstPacket := {
@@ -410,7 +444,7 @@ FirstPacket := {
 }
 ```
 
-**Wire Format**:
+**Wire Format** (offsets relative to the start of the frame body):
 
 ```
 Offset  Size  Field
@@ -420,19 +454,19 @@ Offset  Size  Field
 25      ...   payload (Noise message)
 ```
 
-Total header size: 25 bytes.
+Total header size: 25 bytes. The payload extends to the end of the frame body.
 
-### 7.2 Subsequent Packets
+### 7.3 Subsequent Packets
 
-After the first packet, all data is Noise protocol encrypted:
+After the first packet, every frame body is a single Noise protocol message:
 
 ```
 SubsequentPacket := {
-    payload: BYTES[...]   # Noise transport message
+    payload: BYTES[...]   # Noise handshake or transport message
 }
 ```
 
-### 7.3 Service Selection
+### 7.4 Service Selection
 
 After Noise handshake completes, if multiple services are available, the initiator sends:
 
@@ -444,19 +478,22 @@ ServiceRequest := {
 
 This message is sent through the established encrypted channel.
 
-### 7.4 Broker Messages
+### 7.5 Broker Messages
 
-#### 7.4.1 Registration Request (Client → Broker)
+Broker messages are sent through the encrypted channel established between client (or guest) and broker.
+
+#### 7.5.1 Registration Request (Client → Broker)
 
 ```
 BrokerRegister := {
     type: UINT8,              # 0x01 = REGISTER
     client_pubkey: PublicKey,
-    authorizations: [PublicKey]  # Pubkeys allowed to reach this client
+    auth_count: UINT16,       # Number of authorization entries, big-endian
+    authorizations: [PublicKey]  # auth_count pubkeys allowed to reach this client
 }
 ```
 
-#### 7.4.2 Connect Request (Client → Broker)
+#### 7.5.2 Connect Request (Client → Broker)
 
 ```
 BrokerConnect := {
@@ -465,7 +502,7 @@ BrokerConnect := {
 }
 ```
 
-#### 7.4.3 Broker Response
+#### 7.5.3 Broker Response
 
 ```
 BrokerResponse := {
@@ -494,7 +531,7 @@ Relationship establishment occurs out-of-band. Parties exchange:
 1. Public keys (identity)
 2. Prior (32 random bytes)
 3. Handshake password (32 random bytes)
-4. Reachability information
+4. Reachability information (including the routing prefix)
 5. Service definitions
 
 Exchange methods (not specified by this protocol):
@@ -628,17 +665,17 @@ Brokers use a two-tier address scheme:
 
 ```
 session_key = HKDF(ECDH(broker_priv, client_pub), client_prior, ...)
-address = compute_address(session_key, T)
+address = compute_address(session_key, broker_pubkey, broker_prefix, T)
 ```
 
 **Guest Addresses** (for initiators):
 
 ```
 session_key = HKDF(ECDH(broker_priv, guest_pub), guest_prior, ...)
-address = compute_address(session_key, T)
+address = compute_address(session_key, broker_pubkey, broker_prefix, T)
 ```
 
-The guest_prior is shared by clients when they share their reachability information.
+The broker is the responder for these connections, so its public key and routing prefix enter the address computation (Section 6.3). The guest_prior and the broker's prefix are shared by clients when they share their reachability information.
 
 ### 9.3 Broker Authorization
 
@@ -647,7 +684,8 @@ Clients pre-authorize which public keys may reach them:
 ```
 BrokerRegister {
     client_pubkey: client_pub,
-    authorizations: [allowed_pub_1, allowed_pub_2, ...]
+    auth_count: N,
+    authorizations: [allowed_pub_1, ..., allowed_pub_N]
 }
 ```
 
@@ -790,7 +828,7 @@ Clients MAY register with multiple brokers for redundancy. Initiators try broker
 
 | Property                  | Mechanism                   | Notes                    |
 | ------------------------- | --------------------------- | ------------------------ |
-| Address unpredictability  | HMAC-SHA256 with secret key | 2^128 address space      |
+| Address unpredictability  | HMAC-SHA256 with secret key | 2^(128-P) addresses × ~2^16 ports per bucket within a known prefix (≈2^80 for a /64) |
 | Connection authentication | Noise IKpsk2                | Mutual authentication    |
 | Forward secrecy           | Ephemeral keys in Noise     | Per-session keys         |
 | Replay protection         | Timestamp + nonce           | Window-based validation  |
@@ -841,6 +879,7 @@ Implementations SHOULD implement rate limiting:
 3. **Initial exchange security**: Relationship security depends on initial exchange security
 4. **Metadata at broker**: Brokers observe connection graph and traffic patterns
 5. **No post-quantum security**: X25519 and current primitives are not quantum-resistant
+6. **Prefix stability**: Generated addresses depend on the responder's advertised routing prefix; renumbering (e.g., a new ISP-delegated prefix) requires updating reachability information out-of-band
 
 ---
 
@@ -854,6 +893,7 @@ Implementations MUST support:
 - HKDF-SHA256 key derivation
 - HMAC-SHA256 address generation
 - Noise_IKpsk2_25519_ChaChaPoly_SHA256 handshake
+- Length-prefixed message framing (Section 7.1)
 - Timestamp validation with configurable tolerance
 - Nonce tracking and replay rejection
 - Address window computation (current ±1 bucket)
@@ -923,20 +963,29 @@ Input:
             fedcba9876543210 baadf00ddeadbeef
 
 Output:
-    session_key = 0x[TO BE COMPUTED WITH REFERENCE IMPLEMENTATION]
+    session_key = 0xcf9dfe21bf261783 7c0c50d8bb14555e
+                  45e3d2023cedea4c e2ce0bfb48dde05e
 ```
 
 ### 13.4 Address Generation
 
 ```
 Input:
-    session_key = 0x[FROM ABOVE]
-    timestamp = 1706295600  # 2024-01-26 15:00:00 UTC
-    T = floor(1706295600 / 300) = 5687652
+    session_key = 0xcf9dfe21bf261783 7c0c50d8bb14555e
+                  45e3d2023cedea4c e2ce0bfb48dde05e   # From Section 13.3
+    responder_pubkey = bob_public                     # From Section 13.2
+    responder_prefix = 2001:db8:1234:5678::/64        # P = 64
+    timestamp = 1706295600  # 2024-01-26 19:00:00 UTC
+    T = floor(1706295600 / 300) = 5687652  # 0x000000000056c964
+
+Intermediate:
+    input = 0x000000000056c964 || "montauk-v1-address" || bob_public
+    raw = 0x63aaf0499a92bce9 27916876089566ee
+          083c82e88fa71dd5 7648fc882320fd40
 
 Output:
-    ipv6_address = [TO BE COMPUTED]
-    port = [TO BE COMPUTED]
+    ipv6_address = 2001:db8:1234:5678:2791:6876:895:66ee
+    port = 3132   # port_raw = 0x083c = 2108; 1024 + (2108 mod 64511)
 ```
 
 ### 13.5 First Packet
@@ -949,10 +998,11 @@ Input:
     payload = [Noise message bytes]
 
 Output:
-    wire_format = 0x01 || 0x0000000065b3c790 || 0x000102030405060708090a0b0c0d0e0f || [payload]
+    frame_body = 0x01 || 0x0000000065b40130 || 0x000102030405060708090a0b0c0d0e0f || [payload]
+    wire_format = UINT16(len(frame_body)) || frame_body
 ```
 
-_Note: Complete test vectors require a reference implementation to compute. Placeholders marked with [TO BE COMPUTED] will be filled in version 1.0._
+_Note: The Noise handshake payload in Section 13.5 requires a complete Noise implementation; a full handshake transcript vector will be added in version 1.0. All other vectors above are complete._
 
 ---
 
@@ -977,17 +1027,23 @@ _Note: Complete test vectors require a reference implementation to compute. Plac
 ## Appendix A: Wire Format Summary
 
 ```
-FirstPacket (25+ bytes):
+Frame (carries every message):
++----------+------------------+
+|  Length  |       Body       |
+| 2 bytes  |  length bytes    |
++----------+------------------+
+
+FirstPacket (frame body, 25+ bytes):
 +--------+----------------+------------------+------------------+
 | Version|   Timestamp    |      Nonce       |     Payload      |
 | 1 byte |    8 bytes     |    16 bytes      |   variable       |
 +--------+----------------+------------------+------------------+
 
 BrokerRegister:
-+--------+------------------+------------------+
-|  Type  |  Client Pubkey   |  Authorizations  |
-| 1 byte |    32 bytes      |   32*N bytes     |
-+--------+------------------+------------------+
++--------+------------------+------------+------------------+
+|  Type  |  Client Pubkey   | Auth Count |  Authorizations  |
+| 1 byte |    32 bytes      |  2 bytes   |   32*N bytes     |
++--------+------------------+------------+------------------+
 
 BrokerConnect:
 +--------+------------------+
@@ -1011,7 +1067,9 @@ A human-readable exchange format using BIP-39 words:
 ```
 === BOB'S MONTAUK CARD ===
 
-Identity: witch collapse practice feed shame open despair creek road again ice close
+Identity: witch collapse practice feed shame open despair creek road again
+          ice close garden mountain hollow tide salmon orbit meadow crisp
+          anchor ridge maple harvest
 
 Prior: army observe practice letter achieve hunting cat chapter interest grab clinic evolve
        village caught narrow future raw human truly sock hospital clever orphan ability
@@ -1020,16 +1078,28 @@ Password: abandon abandon abandon abandon abandon abandon abandon abandon
           abandon abandon abandon abandon abandon abandon abandon abandon
           abandon abandon abandon abandon abandon about about about
 
-Reachability: DIRECT
+Reachability: DIRECT, prefix 2001:db8:1234:5678::/64
 
 Services: photos, chat
 ```
 
-This encodes approximately 256 bits of key material and 256 bits each of Prior and password, sufficient for the protocol's security requirements.
+Each 24-word mnemonic encodes 256 bits—the public key, Prior, and handshake password respectively—sufficient for the protocol's security requirements.
 
 ---
 
 ## Appendix C: Changelog
+
+### Version 0.2.0-draft (July 2026)
+
+- Address generation now derives only the bits below the responder's advertised routing prefix; added IPv6Prefix to reachability information (a host cannot bind addresses outside its delegated prefix, so full-128-bit generation was unroutable)
+- Bound the responder's static public key into the address HMAC input, giving each direction of a relationship an independent address stream (previously both directions derived identical colliding addresses)
+- Restated the address-unpredictability claim as the searchable space within a known prefix (2^(128-P) × ~2^16 per bucket) instead of "2^128 address space"
+- Added uniform 2-byte length framing for all stream messages (message boundaries were previously undefined)
+- Added auth_count field to BrokerRegister (authorization list length was previously unparseable)
+- Corrected the timestamp encoding in the First Packet test vector (0x65b3c790 → 0x65b40130) and the UTC comment in the address generation test vector (15:00 → 19:00)
+- Filled in the session key and address generation test vectors (Sections 13.3–13.4); verified the key generation and shared secret vectors (Sections 13.1–13.2) against RFC 7748
+- Expanded the Appendix B identity mnemonic to 24 words (a 32-byte public key does not fit in 12 words)
+- Noted prefix stability as a known limitation
 
 ### Version 0.1.0-draft (January 2026)
 
