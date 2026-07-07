@@ -1,9 +1,9 @@
 ---
 title: "The Montauk Protocol"
 author: "Manuel Rodriguez (manuel.rodriguez@teknios.tech)"
-version: "0.2.0-draft"
+version: "0.3.0-draft"
 status: "Draft Specification"
-date: "2026-07-01"
+date: "2026-07-06"
 ---
 
 # The Montauk Protocol
@@ -80,7 +80,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 ### 2.2 Definitions
 
-**Address Stream**: The sequence of (IPv6 address, port) tuples generated over time for one direction of a relationship (one party acting as responder).
+**Address Stream**: The sequence of (IPv6 address, port) tuples generated over time for one service offered by one party (the responder for that stream) within a relationship.
 
 **Broker**: A server that facilitates connections between NAT-blocked participants.
 
@@ -229,6 +229,10 @@ Cipher suite: `Noise_IKpsk2_25519_ChaChaPoly_SHA256`
 
 The PSK is the handshake_password from the relationship.
 
+**Prologue**: The Noise prologue is the 25-byte FirstPacket header (version || timestamp || nonce), exactly as transmitted (Section 7.2). This binds the replay-protection fields to the handshake: a tampered or re-stamped header causes AEAD failure when the responder processes message 1, and the packet is dropped silently (Section 11.5).
+
+**Handshake payloads**: For direct connections, both handshake message payloads MUST be zero-length. For brokered connections, the message 1 payload MUST be exactly the 16-byte service_id of the requested service (Section 7.4) and the message 2 payload MUST be zero-length. A receiver MUST abort the handshake silently on any other payload length.
+
 ### 4.5 Constants
 
 | Constant        | Value                | Description                             |
@@ -239,6 +243,7 @@ The PSK is the handshake_password from the relationship.
 | BUCKET_DURATION | 300                  | Time bucket duration in seconds         |
 | PORT_MIN        | 1024                 | Minimum generated port                  |
 | PORT_RANGE      | 64511                | Port range (1024 to 65534)              |
+| BROKER_SERVICE_ID | 16 zero bytes      | service_id for broker rendezvous connections |
 
 ---
 
@@ -366,7 +371,7 @@ A host does not control all 128 bits of its IPv6 address: the high bits are fixe
 For a given time bucket T:
 
 ```
-input = T || ADDRESS_INFO || responder_pubkey
+input = T || ADDRESS_INFO || responder_pubkey || service_id
 raw = HMAC-SHA256(session_key, input)
 
 suffix = raw[0:16] AND NOT prefix_mask(P)
@@ -380,6 +385,7 @@ Where:
 - `T` is encoded as UINT64 big-endian (8 bytes)
 - `ADDRESS_INFO` is the UTF-8 encoding of "montauk-v1-address"
 - `responder_pubkey` is the static public key (32 bytes) of the party that will accept the connection; its inclusion gives each direction of a relationship an independent address stream (Section 6.5)
+- `service_id` is the 16-byte identifier of the requested service (Section 5.5); connections to a broker's rendezvous endpoints use BROKER_SERVICE_ID (Section 4.5)
 - `||` denotes concatenation
 - `responder_prefix` is the responder's advertised routing prefix: 16 bytes with all bits below the prefix length set to zero
 - `P` is the advertised prefix length in bits; `prefix_mask(P)` is the 128-bit mask with the high P bits set
@@ -388,16 +394,18 @@ Where:
 
 The responder MUST ensure the advertised prefix actually routes to it (typically by advertising the /64 of the network segment the Montauk Server occupies). A shorter prefix leaves more derived bits and therefore a larger unauthorized search space (Section 11.2).
 
+Each service in a relationship has its own address stream: the (address, port) tuple an initiator connects to identifies both the relationship and the service, so no in-band service selection is needed for direct connections (Section 7.4), and per-service revocation is enforced at the network layer (Section 8.4).
+
 ### 6.4 Address Window
 
-To accommodate clock drift, implementations SHOULD maintain a window of valid addresses:
+To accommodate clock drift, implementations SHOULD maintain a window of valid addresses for each (relationship, service) pair:
 
 ```
 current_T = T(now)
 valid_addresses = [
-    compute_address(session_key, responder_pubkey, responder_prefix, current_T - 1),
-    compute_address(session_key, responder_pubkey, responder_prefix, current_T),
-    compute_address(session_key, responder_pubkey, responder_prefix, current_T + 1)
+    compute_address(session_key, responder_pubkey, responder_prefix, service_id, current_T - 1),
+    compute_address(session_key, responder_pubkey, responder_prefix, service_id, current_T),
+    compute_address(session_key, responder_pubkey, responder_prefix, service_id, current_T + 1)
 ]
 ```
 
@@ -405,7 +413,7 @@ This provides tolerance of ±BUCKET_DURATION seconds (±5 minutes with default s
 
 ### 6.5 Directionality
 
-The session key (Section 6.2) is symmetric, but address computation is role-separated: the responder's static public key is part of the HMAC input, and the resulting address lies within that responder's routing prefix. Each direction of a relationship therefore has an independent address stream. The **responder** binds to addresses from its own stream; the **initiator** connects to them.
+The session key (Section 6.2) is symmetric, but address computation is role-separated: the responder's static public key and the service identifier are part of the HMAC input, and the resulting address lies within that responder's routing prefix. Each direction of a relationship—and each service—therefore has an independent address stream. The **responder** binds to addresses from its own stream; the **initiator** connects to them.
 
 For bidirectional relationships where either party may initiate:
 
@@ -456,6 +464,8 @@ Offset  Size  Field
 
 Total header size: 25 bytes. The payload extends to the end of the frame body.
 
+The 25-byte header is the Noise prologue (Section 4.4). A version byte other than the version pinned at relationship establishment makes the packet invalid; it MUST be dropped silently (Section 11.5). Versions are never negotiated in-band.
+
 ### 7.3 Subsequent Packets
 
 After the first packet, every frame body is a single Noise protocol message:
@@ -468,15 +478,9 @@ SubsequentPacket := {
 
 ### 7.4 Service Selection
 
-After Noise handshake completes, if multiple services are available, the initiator sends:
+There is no service selection message. For direct connections, the (address, port) tuple the initiator connected to identifies both the relationship and the service (Section 6.3); the responder proxies to that service's internal_target once the handshake completes.
 
-```
-ServiceRequest := {
-    service_id: BYTES[16]    # UUID of requested service
-}
-```
-
-This message is sent through the established encrypted channel.
+For brokered connections, no address selects the service, so the initiator carries the 16-byte service_id as the payload of Noise handshake message 1 (Section 4.4).
 
 ### 7.5 Broker Messages
 
@@ -502,7 +506,22 @@ BrokerConnect := {
 }
 ```
 
-#### 7.5.3 Broker Response
+#### 7.5.3 Accept (Client → Broker)
+
+Sent on a freshly opened data connection to claim a match offer (Section 9.4):
+
+```
+BrokerAccept := {
+    type: UINT8,              # 0x03 = ACCEPT
+    match_id: BYTES[16]       # From the MATCH_OFFER being accepted
+}
+```
+
+#### 7.5.4 Keepalive
+
+A Noise transport message with a zero-length plaintext is a keepalive. Keepalives carry no data and MUST otherwise be ignored. The client SHOULD send a keepalive on its control connection every KEEPALIVE_INTERVAL (Section 9.4); the broker MUST answer each client keepalive with one keepalive of its own, which is not itself answered.
+
+#### 7.5.5 Broker Response
 
 ```
 BrokerResponse := {
@@ -511,14 +530,15 @@ BrokerResponse := {
 }
 ```
 
-| Type | Meaning            | Payload                    |
-| ---- | ------------------ | -------------------------- |
-| 0x10 | REGISTERED         | Empty                      |
-| 0x11 | WAITING            | Empty                      |
-| 0x12 | MATCHED            | Empty (bridge established) |
-| 0x20 | ERROR_UNAUTHORIZED | Empty                      |
-| 0x21 | ERROR_NOT_FOUND    | Empty                      |
-| 0x22 | ERROR_TIMEOUT      | Empty                      |
+| Type | Meaning            | Payload                                    |
+| ---- | ------------------ | ------------------------------------------ |
+| 0x10 | REGISTERED         | Empty                                      |
+| 0x11 | WAITING            | Empty                                      |
+| 0x12 | MATCHED            | Empty (bridge live after this message)     |
+| 0x13 | MATCH_OFFER        | match_id: BYTES[16] (on control connection) |
+| 0x20 | ERROR_UNAUTHORIZED | Empty                                      |
+| 0x21 | ERROR_NOT_FOUND    | Empty                                      |
+| 0x22 | ERROR_TIMEOUT      | Empty                                      |
 
 ---
 
@@ -564,6 +584,7 @@ Initiator                                         Responder
     |                                                  |
     |                    [Validate timestamp window]   |
     |                    [Check nonce not replayed]    |
+    |                    [Prologue = header bytes]     |
     |                    [Process Noise message]       |
     |                                                  |
     |<-------------------------------------------------|
@@ -574,10 +595,7 @@ Initiator                                         Responder
     |  [Handshake complete]                            |
     |  [Encrypted channel established]                 |
     |                                                  |
-    |  ServiceRequest { service_id }                   |
-    |------------------------------------------------->|
-    |                                                  |
-    |                    [Validate service access]     |
+    |                    [Address identifies service]  |
     |                    [Proxy to internal service]   |
     |                                                  |
     |<================== Encrypted Data ==============>|
@@ -590,15 +608,13 @@ Initiator                                         Responder
 NAT Client                    Broker                    NAT Client
 (Initiator)                                            (Responder)
     |                           |                           |
-    |  [Responder pre-registered with broker]               |
+    |  [Responder registered; persistent control conn]      |
+    |                           |<==== control (Noise) ====>|
     |                           |                           |
-    |                           |<-- Persistent connection --|
-    |                           |                           |
-    |  [Compute broker address]                             |
+    |  [Compute broker guest address for current T]         |
     |                           |                           |
     |------ TCP connect ------->|                           |
-    |                           |                           |
-    |  Noise handshake with broker                          |
+    |  Noise handshake (guest)  |                           |
     |<=========================>|                           |
     |                           |                           |
     |  BrokerConnect {                                      |
@@ -607,22 +623,44 @@ NAT Client                    Broker                    NAT Client
     |-------------------------->|                           |
     |                           |                           |
     |                           |  [Check authorization]    |
-    |                           |  [Find responder conn]    |
+    |                           |  [Generate match_id]      |
     |                           |                           |
-    |                           |  BrokerResponse {         |
-    |                           |    type: MATCHED          |
+    |  BrokerResponse {         |  BrokerResponse {         |
+    |    type: WAITING          |    type: MATCH_OFFER,     |
+    |  }                        |    payload: match_id      |
     |                           |  }                        |
     |<--------------------------|-------------------------->|
     |                           |                           |
-    |  [Broker now bridges bytes bidirectionally]           |
+    |                           |  [Responder opens a NEW   |
+    |                           |   data connection]        |
+    |                           |<------ TCP connect -------|
+    |                           |  Noise handshake (client) |
+    |                           |<=========================>|
     |                           |                           |
-    |  End-to-end Noise handshake (through broker)          |
+    |                           |  BrokerAccept {           |
+    |                           |    match_id               |
+    |                           |  }                        |
+    |                           |<--------------------------|
+    |                           |                           |
+    |  BrokerResponse {         |  BrokerResponse {         |
+    |    type: MATCHED          |    type: MATCHED          |
+    |  }                        |  }                        |
+    |<--------------------------|-------------------------->|
+    |                           |                           |
+    |  [Broker bridges the initiator connection and the     |
+    |   data connection; control connection stays open]     |
+    |                           |                           |
+    |  End-to-end Montauk handshake through the bridge      |
+    |  (framed FirstPacket, identical to direct)            |
     |<======================================================>|
     |                           |                           |
     |  [Encrypted channel established]                      |
-    |  [Broker sees only ciphertext]                        |
+    |  [Broker sees only ciphertext and cannot replay       |
+    |   the handshake (header is prologue-bound)]           |
     |                           |                           |
 ```
+
+The bridged byte stream is identical to a direct connection: the responder applies the same FirstPacket validation (timestamp, nonce, prologue) to bytes arriving over a bridge as to a direct socket, and the message 1 payload carries the service_id (Section 7.4).
 
 ### 8.4 Revocation
 
@@ -633,7 +671,7 @@ Revocation is local to the revoking party:
 1. Remove service from relationship's service list
 2. Stop computing addresses for that service
 3. Update valid set
-4. Next connection attempt for that service fails
+4. Connection attempts to that service's tuples are silently dropped at the network layer
 
 **Full Relationship Revocation**:
 
@@ -652,10 +690,10 @@ Revocation takes effect immediately for new connections. Existing connections MA
 
 A broker facilitates connections for NAT-blocked participants. The broker:
 
-- Maintains persistent connections from registered clients
+- Maintains a persistent control connection from each registered client
 - Accepts guest connections from initiators
-- Bridges matched pairs
-- Cannot decrypt end-to-end encrypted traffic
+- Offers matches to responders and bridges accepted pairs over dedicated data connections (Section 9.4)
+- Cannot decrypt or replay end-to-end traffic
 
 ### 9.2 Broker Address Generation
 
@@ -665,14 +703,14 @@ Brokers use a two-tier address scheme:
 
 ```
 session_key = HKDF(ECDH(broker_priv, client_pub), client_prior, ...)
-address = compute_address(session_key, broker_pubkey, broker_prefix, T)
+address = compute_address(session_key, broker_pubkey, broker_prefix, BROKER_SERVICE_ID, T)
 ```
 
 **Guest Addresses** (for initiators):
 
 ```
 session_key = HKDF(ECDH(broker_priv, guest_pub), guest_prior, ...)
-address = compute_address(session_key, broker_pubkey, broker_prefix, T)
+address = compute_address(session_key, broker_pubkey, broker_prefix, BROKER_SERVICE_ID, T)
 ```
 
 The broker is the responder for these connections, so its public key and routing prefix enter the address computation (Section 6.3). The guest_prior and the broker's prefix are shared by clients when they share their reachability information.
@@ -704,7 +742,32 @@ else:
     reject with ERROR_UNAUTHORIZED
 ```
 
-### 9.4 Broker Security Properties
+### 9.4 Match Protocol and Timeouts
+
+The control connection established at registration is never converted into a bridge. When an authorized BrokerConnect arrives for a registered client, the broker:
+
+1. Generates a match_id: 16 bytes from a cryptographically secure RNG
+2. Sends MATCH_OFFER { match_id } on the target's control connection and WAITING to the initiator
+3. Waits up to DIAL_BACK_TIMEOUT for a new data connection that authenticates as the target and presents BrokerAccept { match_id }
+4. Sends MATCHED to both the initiator connection and the data connection, then bridges the two byte streams until either side closes
+
+match_id values are single-use and expire after DIAL_BACK_TIMEOUT. A BrokerAccept with an expired or unknown match_id, or from a connection not authenticated as the offered target, is answered with ERROR_NOT_FOUND. If the offer expires, the broker sends ERROR_TIMEOUT to the initiator.
+
+Default timing and limits (all configurable):
+
+| Parameter                | Default | Description                                    |
+| ------------------------ | ------- | ---------------------------------------------- |
+| KEEPALIVE_INTERVAL       | 25 s    | Client keepalive period on control connection  |
+| CLIENT_DEAD_AFTER        | 75 s    | No traffic on control connection → unregister  |
+| DIAL_BACK_TIMEOUT        | 10 s    | MATCH_OFFER validity window                    |
+| CONNECT_TIMEOUT          | 30 s    | Initiator's overall brokered-connect budget    |
+| BRIDGE_HANDSHAKE_TIMEOUT | 5 s     | End-to-end handshake deadline (Section 11.6)   |
+| MAX_BRIDGES_PER_CLIENT   | 8       | Concurrent bridges per registered client       |
+| MAX_PENDING_MATCHES      | 4       | Outstanding MATCH_OFFERs per client            |
+
+Bridges have no idle timeout of their own: bridged traffic is opaque to the broker, so liveness is the endpoints' responsibility. A bridge is torn down when either side closes its connection.
+
+### 9.5 Broker Security Properties
 
 | Property                | Guarantee                                           |
 | ----------------------- | --------------------------------------------------- |
@@ -713,8 +776,9 @@ else:
 | Relationship graph      | Broker knows who connects to whom                   |
 | Traffic analysis        | Broker can observe timing and volume                |
 | Impersonation           | Broker cannot impersonate clients (no private keys) |
+| Handshake replay        | Broker cannot replay end-to-end handshakes (header is prologue-bound; timestamps expire) |
 
-### 9.5 Broker Redundancy
+### 9.6 Broker Redundancy
 
 Clients MAY register with multiple brokers for redundancy. Initiators try brokers in order until connection succeeds.
 
@@ -784,24 +848,34 @@ Clients MAY register with multiple brokers for redundancy. Initiators try broker
                     └──────────────┘
 ```
 
-### 10.3 Broker State (Per Client)
+### 10.3 Broker State
+
+**Control connection (per client)**:
 
 ```
-                    ┌──────────────┐
-                    │ UNREGISTERED │
-                    └──────┬───────┘
-                           │ BrokerRegister received
-                           ▼
-                    ┌──────────────┐
-                    │  REGISTERED  │◄─────────────┐
-                    └──────┬───────┘              │
-                           │ BrokerConnect       │
-                           │ for this client     │
-                           ▼                     │
-                    ┌──────────────┐             │
-                    │   BRIDGING   │─────────────┘
-                    └──────────────┘  Bridge closed
+        ┌──────────────┐  BrokerRegister received  ┌──────────────┐
+        │ UNREGISTERED │──────────────────────────►│  REGISTERED  │
+        └──────────────┘                           └──────┬───────┘
+               ▲              Disconnect or               │
+               └───────── CLIENT_DEAD_AFTER ──────────────┘
 ```
+
+The control connection never leaves REGISTERED while healthy; it receives MATCH_OFFERs but is never itself bridged.
+
+**Match (per BrokerConnect)**:
+
+```
+  ┌───────────┐ MATCH_OFFER sent ┌───────────┐ BrokerAccept   ┌───────────┐
+  │ REQUESTED │─────────────────►│  OFFERED  │───────────────►│ BRIDGING  │
+  └───────────┘                  └─────┬─────┘  { match_id }  └─────┬─────┘
+                                       │ DIAL_BACK_TIMEOUT          │ Either side
+                                       ▼                            ▼ closes
+                                 ┌───────────┐                ┌───────────┐
+                                 │  EXPIRED  │                │  CLOSED   │
+                                 └───────────┘                └───────────┘
+```
+
+Matches are independent objects keyed by match_id; each BRIDGING match owns one initiator connection and one data connection.
 
 ---
 
@@ -831,7 +905,7 @@ Clients MAY register with multiple brokers for redundancy. Initiators try broker
 | Address unpredictability  | HMAC-SHA256 with secret key | 2^(128-P) addresses × ~2^16 ports per bucket within a known prefix (≈2^80 for a /64) |
 | Connection authentication | Noise IKpsk2                | Mutual authentication    |
 | Forward secrecy           | Ephemeral keys in Noise     | Per-session keys         |
-| Replay protection         | Timestamp + nonce           | Window-based validation  |
+| Replay protection         | Timestamp + nonce, bound via Noise prologue | Header tampering breaks the handshake (Section 4.4) |
 | Traffic confidentiality   | ChaCha20-Poly1305           | Authenticated encryption |
 
 ### 11.3 Timestamp Validation
@@ -856,6 +930,7 @@ Servers MUST track recently seen nonces:
 Servers MUST NOT send responses to invalid connection attempts:
 
 - Invalid address: DROP (no response)
+- Unknown or mismatched version: DROP (no response)
 - Invalid timestamp: DROP (no response)
 - Replayed nonce: DROP (no response)
 - Failed handshake: close connection silently
@@ -893,6 +968,8 @@ Implementations MUST support:
 - HKDF-SHA256 key derivation
 - HMAC-SHA256 address generation
 - Noise_IKpsk2_25519_ChaChaPoly_SHA256 handshake
+- Noise prologue bound to the First Packet header (Section 4.4)
+- Handshake payload length validation (Section 4.4)
 - Length-prefixed message framing (Section 7.1)
 - Timestamp validation with configurable tolerance
 - Nonce tracking and replay rejection
@@ -969,40 +1046,154 @@ Output:
 
 ### 13.4 Address Generation
 
+All address vectors use:
+
+```
+session_key = 0xcf9dfe21bf261783 7c0c50d8bb14555e
+              45e3d2023cedea4c e2ce0bfb48dde05e   # From Section 13.3
+responder_pubkey = bob_public                     # From Section 13.2
+service_id = 0x0f0e0d0c0b0a0908 0706050403020100
+```
+
+**Vector A — /64 prefix**:
+
 ```
 Input:
-    session_key = 0xcf9dfe21bf261783 7c0c50d8bb14555e
-                  45e3d2023cedea4c e2ce0bfb48dde05e   # From Section 13.3
-    responder_pubkey = bob_public                     # From Section 13.2
-    responder_prefix = 2001:db8:1234:5678::/64        # P = 64
-    timestamp = 1706295600  # 2024-01-26 19:00:00 UTC
+    responder_prefix = 2001:db8:1234:5678::/64    # P = 64
+    timestamp = 1706295600  # 2024-01-26 19:00:00 UTC (exact bucket boundary)
     T = floor(1706295600 / 300) = 5687652  # 0x000000000056c964
 
 Intermediate:
-    input = 0x000000000056c964 || "montauk-v1-address" || bob_public
-    raw = 0x63aaf0499a92bce9 27916876089566ee
-          083c82e88fa71dd5 7648fc882320fd40
+    input = 0x000000000056c964 || "montauk-v1-address" || bob_public || service_id
+    raw = 0xc2ffd88025566ce5 9045c6c4d54a135a
+          747d431efdb1f3ef fcdb66edf3fc9958
 
 Output:
-    ipv6_address = 2001:db8:1234:5678:2791:6876:895:66ee
-    port = 3132   # port_raw = 0x083c = 2108; 1024 + (2108 mod 64511)
+    ipv6_address = 2001:db8:1234:5678:9045:c6c4:d54a:135a
+    port = 30845   # port_raw = 0x747d = 29821; 1024 + (29821 mod 64511)
+```
+
+**Vector B — /80 prefix (exercises non-/64 masking)**:
+
+```
+Input:
+    responder_prefix = 2001:db8:1234:5678:9abc::/80   # P = 80
+    T = 5687652   # Same inputs as Vector A otherwise
+
+Intermediate:
+    raw = (identical to Vector A: the prefix is not an HMAC input)
+
+Output:
+    ipv6_address = 2001:db8:1234:5678:9abc:c6c4:d54a:135a
+    port = 30845   # Identical to Vector A
+```
+
+**Vector C — port modulo (port_raw ≥ PORT_RANGE)**:
+
+```
+Input:
+    responder_prefix = 2001:db8:1234:5678::/64
+    timestamp = 1706321400  # 2024-01-27 02:10:00 UTC
+    T = 5687738  # 0x000000000056c9ba
+
+Intermediate:
+    raw = 0xb343b4d7e9c46f4d a213fa43dec4679f
+          fd007be8fe387882 9b3115c59d1ae66a
+
+Output:
+    ipv6_address = 2001:db8:1234:5678:a213:fa43:dec4:679f
+    port = 1281   # port_raw = 0xfd00 = 64768 ≥ 64511; 1024 + (64768 mod 64511)
 ```
 
 ### 13.5 First Packet
+
+Uses noise_message_1 from the direct handshake transcript (Section 13.6):
 
 ```
 Input:
     version = 0x01
     timestamp = 1706295600
     nonce = 0x000102030405060708090a0b0c0d0e0f
-    payload = [Noise message bytes]
+    payload = noise_message_1   # 96 bytes, Section 13.6
 
 Output:
-    frame_body = 0x01 || 0x0000000065b40130 || 0x000102030405060708090a0b0c0d0e0f || [payload]
-    wire_format = UINT16(len(frame_body)) || frame_body
+    frame_body = 0x01 || 0x0000000065b40130 || 0x000102030405060708090a0b0c0d0e0f || noise_message_1
+    noise_prologue = frame_body[0:25]   # version || timestamp || nonce (Section 4.4)
+    wire_format = 0x0079 || frame_body  # 121-byte body, 123 bytes on the wire
 ```
 
-_Note: The Noise handshake payload in Section 13.5 requires a complete Noise implementation; a full handshake transcript vector will be added in version 1.0. All other vectors above are complete._
+### 13.6 Handshake Transcript (Direct)
+
+Full Noise_IKpsk2_25519_ChaChaPoly_SHA256 handshake with fixed ephemeral keys. Alice initiates; Bob responds. The static keys are the pair from Section 13.2; the initiator ephemeral is the key from Section 13.1. Per Section 4.4, both handshake payloads are empty (the service is selected by the address, Vector A of Section 13.4).
+
+```
+Input:
+    init_static = alice_private                       # Section 13.2
+    resp_static = 0x5dab087e624a8a4b 79e17f8b83800ee6
+                  6f3bb1292618b6fd 1c2f8b27ff88e0eb   # bob_private
+    init_ephemeral = 0x0001020304050607 08090a0b0c0d0e0f
+                     1011121314151617 18191a1b1c1d1e1f   # Section 13.1 key
+    resp_ephemeral = 0x4041424344454647 48494a4b4c4d4e4f
+                     5051525354555657 58595a5b5c5d5e5f
+    resp_ephemeral_pub = 0x79a631eede1bf9c9 8f12032cdeadd0e7
+                         a079398fc786b88c c846ec89af85a51a
+    psk (handshake_password) = 0x6061626364656667 68696a6b6c6d6e6f
+                               7071727374757677 78797a7b7c7d7e7f
+    prologue = 0x01 || 0x0000000065b40130 || 0x000102030405060708090a0b0c0d0e0f
+    msg1_payload = empty
+    msg2_payload = empty
+
+Output:
+    noise_message_1 (96 bytes) =
+        0x8f40c5adb68f2562 4ae5b214ea767a6e c94d829d3d7b5e1a d1ba6f3e2138285f
+          b7983d2f78e86e68 627ad14f8e48a8dc 563c3b7bdc8ed982 0f59e762fdbb7c40
+          e5ce5d480fd47788 73a7192808890d9e 1b578ab8fbd911ff 05935702900a9e14
+
+    noise_message_2 (48 bytes) =
+        0x79a631eede1bf9c9 8f12032cdeadd0e7 a079398fc786b88c c846ec89af85a51a
+          f689e44f383a6d2c f4fefbb9f157e382
+
+    handshake_hash =
+        0xa4d854c2aebc7e23 f8248cbcc402d5a7 1f8537718673ee9e 26b05abe6965cdde
+
+    transport_1 (initiator → responder, plaintext "ping", 20 bytes) =
+        0x892a5643ce98792b c9f31eda2a98ebb1 13c206e3
+
+    transport_2 (responder → initiator, plaintext "pong", 20 bytes) =
+        0xe2bf3db33c5f6e1b ac08525760048663 2a256ba2
+```
+
+On the wire, noise_message_2 is framed as 0x0030 || noise_message_2 and each transport message as 0x0014 || transport (Section 7.1).
+
+### 13.7 Handshake Transcript (Brokered)
+
+Identical inputs to Section 13.6 except the First Packet nonce (and therefore the prologue), and the message 1 payload, which carries the service_id from Section 13.4 (Sections 4.4 and 7.4):
+
+```
+Input:
+    nonce = 0x101112131415161718191a1b1c1d1e1f
+    prologue = 0x01 || 0x0000000065b40130 || 0x101112131415161718191a1b1c1d1e1f
+    msg1_payload = service_id = 0x0f0e0d0c0b0a0908 0706050403020100
+    msg2_payload = empty
+
+Output:
+    noise_message_1 (112 bytes) =
+        0x8f40c5adb68f2562 4ae5b214ea767a6e c94d829d3d7b5e1a d1ba6f3e2138285f
+          b7983d2f78e86e68 627ad14f8e48a8dc 563c3b7bdc8ed982 0f59e762fdbb7c40
+          c920351fb82ad24d a835fad0ec39f92f a38477b0ebadb6c7 98dfc16e5a115540
+          548ad38e5570b509 e29877dbe4513124
+
+    noise_message_2 (48 bytes) =
+        0x79a631eede1bf9c9 8f12032cdeadd0e7 a079398fc786b88c c846ec89af85a51a
+          5e04cf6f6ad1a2a3 44bd386c030ab9ec
+
+    handshake_hash =
+        0x9bf3604eac6ba2dc 2b090db8eeb80efa 39b6b0d6e5994692 452117d09a39d8d8
+```
+
+The First Packet frame body is 137 bytes (wire_format = 0x0089 || frame_body).
+
+_Note: All test vectors are complete. They were generated with a reference implementation whose X25519 is validated against RFC 7748 Section 6.1 and whose Noise stack reproduces the official cacophony test vector for Noise_IKpsk2_25519_ChaChaPoly_SHA256 byte-for-byte, including transport messages and handshake hash._
 
 ---
 
@@ -1051,6 +1242,12 @@ BrokerConnect:
 | 1 byte |    32 bytes      |
 +--------+------------------+
 
+BrokerAccept:
++--------+------------------+
+|  Type  |     Match ID     |
+| 1 byte |    16 bytes      |
++--------+------------------+
+
 BrokerResponse:
 +--------+------------------+
 |  Type  |     Payload      |
@@ -1088,6 +1285,19 @@ Each 24-word mnemonic encodes 256 bits—the public key, Prior, and handshake pa
 ---
 
 ## Appendix C: Changelog
+
+### Version 0.3.0-draft (July 2026)
+
+- Defined the Noise prologue as the 25-byte First Packet header, binding the timestamp and nonce into the handshake (replayed or re-stamped packets now fail AEAD decryption and are dropped silently, including through brokers)
+- Address derivation now includes the service_id: each service has its own address stream, the connected tuple selects the service, and per-service revocation is enforced at the network layer; removed the ServiceRequest message
+- Brokered connections carry the service_id as the Noise message 1 payload; added BROKER_SERVICE_ID for broker rendezvous connections
+- Handshake payload lengths are strictly validated (zero-length except brokered message 1)
+- Unknown version bytes are silently dropped; versions are pinned at relationship establishment, never negotiated in-band
+- Reworked the broker protocol as a control/data split: control connections stay registered and receive MATCH_OFFER with a single-use match_id; bridges run on dedicated data connections claimed via the new BrokerAccept message
+- Added broker keepalives (zero-length Noise transport messages), default timeouts, and per-client limits
+- Rewrote the broker state machine (control connections never leave REGISTERED; matches are independent objects)
+- Regenerated the address generation vectors for the new derivation; added vectors for non-/64 prefix masking and the port modulo path
+- Added complete handshake transcript vectors for direct and brokered connections (Sections 13.6–13.7), validated against the official Noise cacophony vectors, and completed the First Packet vector
 
 ### Version 0.2.0-draft (July 2026)
 
