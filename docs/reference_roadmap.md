@@ -276,3 +276,19 @@ bugs concentrated in the I/O shell. All fixed except L8:
 
 Verdicts: implementation faithful on the crypto/wire core, now faithful on the
 firewall/valid-set enforcement and broker keepalives too; protocol design sound.
+
+**Re-review (fresh agent, after the fixes):** confirmed no regressions and that
+all six fixes above are correct and complete (crypto re-verified byte-exact
+against the vectors). It found five more, now fixed:
+
+| # | Finding | Fix |
+| - | ------- | --- |
+| MEDIUM-1 | broker's own control-link handshake had no timeout (the one slowloris hole M3 missed) | `wait_for(HANDSHAKE_TIMEOUT)` around `do_broker_link_responder` + first read in `_on_conn` |
+| MEDIUM-2 | `save_card` wrote cards (private key, prior, password) world-readable | create + `fchmod` 0600; test asserts the mode |
+| LOW-3 | `broker.connect()` indexed `resp[0]` after only a `None` check | guard `if not resp` |
+| LOW-4 | §9.4 `MAX_BRIDGES_PER_CLIENT` and `CONNECT_TIMEOUT` unimplemented | per-client bridge counter/cap; `wait_for(CONNECT_TIMEOUT)` in `connect()` |
+| LOW-5 | a wedged client holding `_Control.lock` across `drain()` could stall MATCH_OFFERs | bound the control write with `WRITE_TIMEOUT` |
+
+Only L8 (computed §9.2 broker rendezvous addresses) remains open — a feature,
+not a bug. Re-review re-verdict: faithful on everything that matters; design
+sound; nothing material outstanding.

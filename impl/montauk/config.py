@@ -7,6 +7,7 @@ is the persisted form of the out-of-band exchange.
 """
 
 import json
+import os
 
 from .core import crypto
 from .core.model import (
@@ -104,7 +105,11 @@ def save_card(path: str, identity: Identity, relationships) -> None:
         },
         "relationships": [_relationship_to_json(r) for r in relationships],
     }
-    with open(path, "w") as f:
+    # A card holds the private key, prior, and handshake_password in the clear;
+    # create it 0600 (before writing) so a local co-tenant cannot read them.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)  # force 0600 even if the file pre-existed with a looser mode
+    with os.fdopen(fd, "w") as f:
         json.dump(doc, f, indent=2)
 
 

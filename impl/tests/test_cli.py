@@ -2,6 +2,7 @@
 """CLI: card round-trip and a pair -> serve -> connect e2e over loopback."""
 
 import asyncio
+import stat
 
 from conftest import ORIGIN_BODY, http_get, start_origin
 
@@ -36,6 +37,9 @@ def test_pair_writes_loadable_cards(tmp_path):
     assert alice_rels[0].peer_pubkey == bob_id.static_public
     rel, svc = config.find_service(alice_rels, "web")
     assert svc.name == "web"
+    # Cards hold private keys -> must be 0600 (no group/other access).
+    assert stat.S_IMODE(resp.stat().st_mode) == 0o600
+    assert stat.S_IMODE(init.stat().st_mode) == 0o600
 
 
 async def _pair_serve_connect(tmp_path) -> bytes:

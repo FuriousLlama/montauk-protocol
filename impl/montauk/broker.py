@@ -43,6 +43,9 @@ DIAL_BACK_TIMEOUT = 10  # MATCH_OFFER validity window (§9.4)
 KEEPALIVE_INTERVAL = 25  # client sends a keepalive this often (§9.4)
 CLIENT_DEAD_AFTER = 75  # no keepalive within this -> reap the registration (§9.4)
 MAX_PENDING_MATCHES = 4  # outstanding MATCH_OFFERs per client (§9.4)
+MAX_BRIDGES_PER_CLIENT = 8  # concurrent bridges per client (§9.4)
+CONNECT_TIMEOUT = 30  # initiator's overall connect budget (§9.4)
+WRITE_TIMEOUT = 10  # bound a control-channel write so a wedged reader can't hold the lock
 
 
 # --- control message bodies (sent encrypted over the broker link) ---
@@ -69,11 +72,14 @@ class _Control:
     send_cs: object
     authorized: set[bytes]
     pending: int = 0  # outstanding MATCH_OFFERs (§9.4 MAX_PENDING_MATCHES)
+    bridges: int = 0  # concurrent bridges (§9.4 MAX_BRIDGES_PER_CLIENT)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def push(self, body: bytes) -> None:
         async with self.lock:  # serialize cipher-state use across concurrent offers/keepalives
-            await transport.write_encrypted(self.writer, self.send_cs, body)
+            # Bound the write so a wedged (non-reading) client can't hold the lock
+            # and block MATCH_OFFERs to other initiators.
+            await asyncio.wait_for(transport.write_encrypted(self.writer, self.send_cs, body), WRITE_TIMEOUT)
 
 
 @dataclass
@@ -112,10 +118,13 @@ class MontaukBroker:
     async def _on_conn(self, reader, writer):
         self._conns.add(asyncio.current_task())
         try:
-            send_cs, recv_cs, party = await transport.do_broker_link_responder(
-                reader, writer, static_private=self.static_private, psk=self.link_psk
+            # Bound the unauthenticated link handshake and first control message so a
+            # stalled connection can't pin a coroutine indefinitely (§11.6 slowloris).
+            send_cs, recv_cs, party = await asyncio.wait_for(
+                transport.do_broker_link_responder(reader, writer, static_private=self.static_private, psk=self.link_psk),
+                HANDSHAKE_TIMEOUT,
             )
-            body = await transport.read_encrypted(reader, recv_cs)
+            body = await asyncio.wait_for(transport.read_encrypted(reader, recv_cs), HANDSHAKE_TIMEOUT)
             if not body:
                 writer.close()
                 return
@@ -173,7 +182,7 @@ class MontaukBroker:
             await transport.write_encrypted(writer, send_cs, encode_response(ERROR_UNAUTHORIZED))
             writer.close()
             return
-        if chan.pending >= MAX_PENDING_MATCHES:  # §9.4 per-client cap
+        if chan.pending >= MAX_PENDING_MATCHES or chan.bridges >= MAX_BRIDGES_PER_CLIENT:  # §9.4 caps
             await transport.write_encrypted(writer, send_cs, encode_response(ERROR_TIMEOUT))
             writer.close()
             return
@@ -189,7 +198,11 @@ class MontaukBroker:
             await transport.write_encrypted(writer, send_cs, encode_response(MATCHED))
             await transport.write_encrypted(data_writer, data_send_cs, encode_response(MATCHED))
             log.info("bridging match %s (target %s)", match_id.hex()[:8], target.hex()[:8])
-            await _bridge(reader, writer, data_reader, data_writer)
+            chan.bridges += 1
+            try:
+                await _bridge(reader, writer, data_reader, data_writer)
+            finally:
+                chan.bridges = max(0, chan.bridges - 1)
         except asyncio.TimeoutError:
             with contextlib.suppress(Exception):
                 await transport.write_encrypted(writer, send_cs, encode_response(ERROR_TIMEOUT))
@@ -294,17 +307,26 @@ async def connect(broker_host, broker_port, static_private, broker_pubkey, link_
     handshake over once MATCHED."""
     reader, writer, send_cs, recv_cs = await _open_link(broker_host, broker_port, static_private, broker_pubkey, link_psk)
     await transport.write_encrypted(writer, send_cs, encode_connect(target_pubkey))
-    while True:
-        resp = await transport.read_encrypted(reader, recv_cs)
-        if resp is None:
-            writer.close()
-            raise RuntimeError("broker closed before match")
-        if resp[0] == WAITING:
-            continue
-        if resp[0] == MATCHED:
-            return reader, writer  # subsequent bytes are raw end-to-end
+
+    async def _await_match():
+        while True:
+            resp = await transport.read_encrypted(reader, recv_cs)
+            if not resp:  # None (EOF) or an unexpected empty frame
+                raise RuntimeError("broker closed before match")
+            if resp[0] == WAITING:
+                continue
+            if resp[0] == MATCHED:
+                return reader, writer  # subsequent bytes are raw end-to-end
+            raise BrokerError(resp[0])
+
+    try:
+        return await asyncio.wait_for(_await_match(), CONNECT_TIMEOUT)  # §9.4 connect budget
+    except asyncio.TimeoutError:
         writer.close()
-        raise BrokerError(resp[0])
+        raise BrokerError(ERROR_TIMEOUT)
+    except Exception:
+        writer.close()
+        raise
 
 
 class BrokerError(Exception):
