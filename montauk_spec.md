@@ -730,23 +730,28 @@ A broker facilitates connections for NAT-blocked participants. The broker:
 
 ### 9.2 Broker Address Generation
 
-Brokers use a two-tier address scheme:
-
-**Client Addresses** (for registered clients):
-
-```
-session_key = HKDF(ECDH(broker_priv, client_pub), client_prior, ...)
-address = compute_address(session_key, broker_pubkey, broker_prefix, BROKER_SERVICE_ID, T)
-```
-
-**Guest Addresses** (for initiators):
+The broker is reachable at a rotating **rendezvous address**, computed like any
+Montauk address (Section 6.3) but keyed from a shared, semi-public
+**guest_prior** rather than a per-relationship secret. Both registering clients
+and connecting initiators use it for initial contact; the broker binds it (AnyIP
++ firewall, as a responder) and rotates it each time bucket.
 
 ```
-session_key = HKDF(ECDH(broker_priv, guest_pub), guest_prior, ...)
-address = compute_address(session_key, broker_pubkey, broker_prefix, BROKER_SERVICE_ID, T)
+session_key = HKDF-SHA256(IKM = broker_pubkey, salt = guest_prior, info = SESSION_INFO)
+address     = compute_address(session_key, broker_pubkey, broker_prefix, BROKER_SERVICE_ID, T)
 ```
 
-The broker is the responder for these connections, so its public key and routing prefix enter the address computation (Section 6.3). The guest_prior and the broker's prefix are shared by clients when they share their reachability information.
+The broker_pubkey, broker_prefix, and guest_prior are shared by clients in their
+reachability information (Section 5.4). Because the guest_prior is semi-public,
+the rendezvous address is unguessable to outsiders yet reachable by any holder
+of a client's reachability card; a party's *identity* is then established by the
+Noise link handshake to the broker (Section 8.3), not by reaching the address.
+
+*Note:* earlier drafts specified per-party addresses derived from
+`ECDH(broker_priv, party_pub)`. A broker cannot pre-bind such an address for an
+initiator whose key it does not yet know, so a single shared rendezvous (above)
+is used instead. Per-client rotating addresses, negotiated after a client has
+registered, remain a possible refinement.
 
 ### 9.3 Broker Authorization
 

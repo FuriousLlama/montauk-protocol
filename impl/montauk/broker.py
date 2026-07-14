@@ -21,9 +21,10 @@ import os
 from dataclasses import dataclass, field
 
 from . import transport
-from .core import wire
-from .core.constants import HANDSHAKE_TIMEOUT
-from .daemon import split_hostport
+from .core import crypto, engine, wire
+from .core.constants import BROKER_SERVICE_ID, HANDSHAKE_TIMEOUT
+from .core.model import IPv6Prefix
+from .daemon import _open_listener, split_hostport
 
 log = logging.getLogger("montauk.broker")
 
@@ -46,6 +47,42 @@ MAX_PENDING_MATCHES = 4  # outstanding MATCH_OFFERs per client (§9.4)
 MAX_BRIDGES_PER_CLIENT = 8  # concurrent bridges per client (§9.4)
 CONNECT_TIMEOUT = 30  # initiator's overall connect budget (§9.4)
 WRITE_TIMEOUT = 10  # bound a control-channel write so a wedged reader can't hold the lock
+
+
+# --- rotating rendezvous address (§9.2) ---
+
+def rendezvous_address(broker_pubkey: bytes, broker_prefix: IPv6Prefix, guest_prior: bytes, T: int):
+    """The broker's rotating rendezvous (address, port) for bucket T (§9.2).
+
+    Reference simplification: a single shared guest rendezvous derived from the
+    semi-public guest_prior plus the broker's public key and prefix, rather than
+    §9.2's per-guest ECDH address (which the broker cannot pre-bind for unknown
+    guests). Identity is still established by the Noise link handshake, not the
+    address."""
+    session_key = crypto.derive_session_key(broker_pubkey, guest_prior)
+    return engine.compute_tuple(session_key, broker_pubkey, broker_prefix, BROKER_SERVICE_ID, T)
+
+
+@dataclass
+class BrokerEndpoint:
+    """How to reach a broker: either a fixed host:port or a rotating rendezvous
+    address computed from the broker's prefix and the shared guest_prior."""
+
+    broker_pubkey: bytes
+    link_psk: bytes
+    host: str | None = None
+    port: int | None = None
+    prefix: IPv6Prefix | None = None
+    guest_prior: bytes | None = None
+    connect_host: str | None = None  # loopback override for the computed address
+    clock: object = None
+
+    def resolve(self) -> tuple[str, int]:
+        if self.prefix is not None and self.guest_prior is not None:
+            now = (self.clock or transport._now)()
+            addr, port = rendezvous_address(self.broker_pubkey, self.prefix, self.guest_prior, engine.time_bucket(now))
+            return (self.connect_host or str(addr)), port
+        return self.host, self.port
 
 
 # --- control message bodies (sent encrypted over the broker link) ---
@@ -92,27 +129,76 @@ class _Pending:
 
 
 class MontaukBroker:
-    def __init__(self, host: str, port: int, static_private: bytes, link_psk: bytes):
+    def __init__(self, host, port, static_private, link_psk, *,
+                 prefix=None, guest_prior=None, bind_host=None, freebind=False, clock=None, sleep=None):
         self.host, self.port = host, port
         self.static_private = static_private
+        self.static_public = crypto.public_key(static_private)
         self.link_psk = link_psk
+        self.prefix, self.guest_prior = prefix, guest_prior  # set both -> rotating rendezvous mode
+        self.bind_host, self.freebind = bind_host, freebind
+        self.clock = clock or transport._now
+        self._sleep = sleep or asyncio.sleep
         self._clients: dict[bytes, _Control] = {}
         self._pending: dict[bytes, _Pending] = {}
         self._conns: set[asyncio.Task] = set()
         self._server = None
+        self._servers: dict[tuple, object] = {}  # rendezvous mode: (addr, port) -> server
+        self._rotation_task: asyncio.Task | None = None
 
-    async def start(self) -> tuple[str, int]:
+    @property
+    def _rendezvous_mode(self) -> bool:
+        return self.prefix is not None and self.guest_prior is not None
+
+    def _rendezvous_window(self, now: int) -> dict:
+        T = engine.time_bucket(now)
+        out = {}
+        for delta in (-1, 0, 1):
+            addr, port = rendezvous_address(self.static_public, self.prefix, self.guest_prior, T + delta)
+            out[(str(addr), port)] = T + delta
+        return out
+
+    async def start(self):
+        if self._rendezvous_mode:
+            await self._sync_rendezvous()
+            self._rotation_task = asyncio.create_task(self._rotation_loop())
+            addr, port = rendezvous_address(self.static_public, self.prefix, self.guest_prior, engine.time_bucket(self.clock()))
+            return str(addr), port
         self._server = await asyncio.start_server(self._on_conn, self.host, self.port)
         return self._server.sockets[0].getsockname()[:2]
 
+    async def _sync_rendezvous(self) -> None:
+        want = set(self._rendezvous_window(self.clock()))
+        have = set(self._servers)
+        for tup in have - want:
+            self._servers.pop(tup).close()
+        for addr, port in want - have:
+            host = self.bind_host or addr
+            self._servers[(addr, port)] = await _open_listener(self._on_conn, host, port, freebind=self.freebind)
+
+    async def _rotation_loop(self) -> None:
+        while True:
+            await self._sleep(engine.next_boundary(self.clock()) - self.clock())
+            try:
+                await self._sync_rendezvous()
+            except Exception:
+                log.exception("rendezvous sync failed; retrying next boundary")
+
     async def close(self) -> None:
-        if self._server is None:
-            return
-        self._server.close()
+        if self._rotation_task is not None:
+            self._rotation_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._rotation_task
+            self._rotation_task = None
         for task in list(self._conns):
             task.cancel()
-        with contextlib.suppress(asyncio.TimeoutError, Exception):
-            await asyncio.wait_for(self._server.wait_closed(), 3)
+        servers = list(self._servers.values()) + ([self._server] if self._server is not None else [])
+        for s in servers:
+            s.close()
+        for s in servers:
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(s.wait_closed(), 3)
+        self._servers.clear()
         self._server = None
 
     async def _on_conn(self, reader, writer):
@@ -252,10 +338,11 @@ async def _bridge(r1, w1, r2, w2):
 
 # --- client-side helpers ---
 
-async def _open_link(broker_host, broker_port, static_private, broker_pubkey, link_psk):
-    reader, writer = await asyncio.open_connection(broker_host, broker_port)
+async def _open_link(endpoint, static_private):
+    host, port = endpoint.resolve()  # fixed host:port or current rotating rendezvous address
+    reader, writer = await asyncio.open_connection(host, port)
     send_cs, recv_cs = await transport.do_broker_link_initiator(
-        reader, writer, static_private=static_private, remote_static=broker_pubkey, psk=link_psk
+        reader, writer, static_private=static_private, remote_static=endpoint.broker_pubkey, psk=endpoint.link_psk
     )
     return reader, writer, send_cs, recv_cs
 
@@ -266,10 +353,10 @@ async def _keepalive_loop(writer, send_cs):
         await transport.write_encrypted(writer, send_cs, b"")  # §7.5.4 keepalive
 
 
-async def register(broker_host, broker_port, static_private, broker_pubkey, link_psk, client_pubkey, authorizations, on_offer):
+async def register(endpoint, static_private, client_pubkey, authorizations, on_offer):
     """Register as a client and dispatch each MATCH_OFFER to on_offer(match_id).
     Sends keepalives and blocks holding the control connection until it drops."""
-    reader, writer, send_cs, recv_cs = await _open_link(broker_host, broker_port, static_private, broker_pubkey, link_psk)
+    reader, writer, send_cs, recv_cs = await _open_link(endpoint, static_private)
     await transport.write_encrypted(writer, send_cs, encode_register(client_pubkey, list(authorizations)))
     resp = await transport.read_encrypted(reader, recv_cs)
     if not resp or resp[0] != REGISTERED:
@@ -290,10 +377,10 @@ async def register(broker_host, broker_port, static_private, broker_pubkey, link
         writer.close()
 
 
-async def dial_back(broker_host, broker_port, static_private, broker_pubkey, link_psk, match_id):
+async def dial_back(endpoint, static_private, match_id):
     """Claim a match with a fresh data connection; returns the raw (reader,
     writer) to run the responder handshake over once MATCHED."""
-    reader, writer, send_cs, recv_cs = await _open_link(broker_host, broker_port, static_private, broker_pubkey, link_psk)
+    reader, writer, send_cs, recv_cs = await _open_link(endpoint, static_private)
     await transport.write_encrypted(writer, send_cs, encode_accept(match_id))
     resp = await transport.read_encrypted(reader, recv_cs)
     if not resp or resp[0] != MATCHED:
@@ -302,10 +389,10 @@ async def dial_back(broker_host, broker_port, static_private, broker_pubkey, lin
     return reader, writer  # subsequent bytes are raw end-to-end
 
 
-async def connect(broker_host, broker_port, static_private, broker_pubkey, link_psk, target_pubkey):
+async def connect(endpoint, static_private, target_pubkey):
     """Request a target; returns the raw (reader, writer) to run the initiator
     handshake over once MATCHED."""
-    reader, writer, send_cs, recv_cs = await _open_link(broker_host, broker_port, static_private, broker_pubkey, link_psk)
+    reader, writer, send_cs, recv_cs = await _open_link(endpoint, static_private)
     await transport.write_encrypted(writer, send_cs, encode_connect(target_pubkey))
 
     async def _await_match():
@@ -338,10 +425,8 @@ class BrokerError(Exception):
 
 # --- brokered responder / initiator glue (used by tests and the M5 harness) ---
 
-async def _serve_offer(broker_host, broker_port, match_id, identity, relationship, nonce_cache, broker_pubkey, link_psk):
-    reader, writer = await dial_back(
-        broker_host, broker_port, identity.static_private, broker_pubkey, link_psk, match_id
-    )
+async def _serve_offer(endpoint, match_id, identity, relationship, nonce_cache):
+    reader, writer = await dial_back(endpoint, identity.static_private, match_id)
     target_writer = None
     try:
         send_cs, recv_cs, service_id = await asyncio.wait_for(
@@ -365,28 +450,21 @@ async def _serve_offer(broker_host, broker_port, match_id, identity, relationshi
         target_writer.close()
 
 
-async def serve_brokered_responder(broker_host, broker_port, identity, relationship, broker_pubkey, link_psk):
+async def serve_brokered_responder(endpoint, identity, relationship):
     """Register and serve brokered connections until cancelled: each MATCH_OFFER
     spawns a dial-back + responder handshake + proxy to the matched service."""
     nonce_cache = wire.NonceCache()
 
     async def on_offer(match_id):
-        asyncio.create_task(
-            _serve_offer(broker_host, broker_port, match_id, identity, relationship, nonce_cache, broker_pubkey, link_psk)
-        )
+        asyncio.create_task(_serve_offer(endpoint, match_id, identity, relationship, nonce_cache))
 
-    await register(
-        broker_host, broker_port, identity.static_private, broker_pubkey, link_psk,
-        identity.static_public, [relationship.peer_pubkey], on_offer,
-    )
+    await register(endpoint, identity.static_private, identity.static_public, [relationship.peer_pubkey], on_offer)
 
 
-async def connect_brokered(broker_host, broker_port, identity, relationship, service_id, broker_pubkey, link_psk):
+async def connect_brokered(endpoint, identity, relationship, service_id):
     """Initiator: reach the peer through the broker and complete the end-to-end
     handshake over the bridge. Returns (send_cs, recv_cs, reader, writer)."""
-    reader, writer = await connect(
-        broker_host, broker_port, identity.static_private, broker_pubkey, link_psk, relationship.peer_pubkey
-    )
+    reader, writer = await connect(endpoint, identity.static_private, relationship.peer_pubkey)
     send_cs, recv_cs = await transport.do_initiator_handshake(
         reader, writer, identity=identity, relationship=relationship, service_id=service_id, brokered=True
     )

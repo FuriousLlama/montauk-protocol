@@ -89,9 +89,9 @@ async def run_responder(args) -> int:
     identity = Identity.from_private(resp_priv, None)
     rel = Relationship(peer_pubkey=crypto.public_key(init_priv), **common)
     bhost, bport = parse_hostport(args.broker)
-    broker_pub = crypto.public_key(broker_priv)
+    endpoint = broker.BrokerEndpoint(crypto.public_key(broker_priv), link_psk, host=bhost, port=bport)
     print(f"[responder] registering with broker {bhost}:{bport}; origin on 127.0.0.1:{ORIGIN_PORT}", flush=True)
-    await broker.serve_brokered_responder(bhost, bport, identity, rel, broker_pub, link_psk)
+    await broker.serve_brokered_responder(endpoint, identity, rel)
     return 0
 
 
@@ -100,10 +100,10 @@ async def run_initiator(args) -> int:
     identity = Identity.from_private(init_priv, None)
     rel = Relationship(peer_pubkey=crypto.public_key(resp_priv), **common)
     bhost, bport = parse_hostport(args.broker)
-    broker_pub = crypto.public_key(broker_priv)
+    endpoint = broker.BrokerEndpoint(crypto.public_key(broker_priv), link_psk, host=bhost, port=bport)
     print(f"[initiator] connecting through broker {bhost}:{bport} ...", flush=True)
     send_cs, recv_cs, reader, writer = await asyncio.wait_for(
-        broker.connect_brokered(bhost, bport, identity, rel, service.service_id, broker_pub, link_psk), 15
+        broker.connect_brokered(endpoint, identity, rel, service.service_id), 15
     )
     print("[initiator] bridged + handshake done; sending GET", flush=True)
     await transport.write_frame(writer, send_cs.encrypt(b"", b"GET / HTTP/1.0\r\nHost: montauk\r\n\r\n"))

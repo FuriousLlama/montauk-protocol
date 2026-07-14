@@ -272,7 +272,7 @@ bugs concentrated in the I/O shell. All fixed except L8:
 | L6 | nonce-cache retention horizon decoupled from validation tolerance | `validate_first_packet` uses `nonce_cache.tolerance` (single source) | Fixed |
 | L7 | TCP FIN close is unauthenticated; broker/on-path can truncate undetectably | Spec caveat added (§8.2, §9.5) | Documented |
 | — | §6.4 overstated skew tolerance as ±5 min (really ≈±30 s, the timestamp∩address intersection) | Spec corrected (§6.4) | Documented |
-| L8 | broker rendezvous is a fixed host:port, not §9.2's computed rotating addresses | — | Open (larger feature; the Noise-auth half was already done in v0.4) |
+| L8 | broker rendezvous is a fixed host:port, not §9.2's computed rotating addresses | `broker.rendezvous_address` + `BrokerEndpoint`; broker binds rotating computed addresses (freebind + rotation) and clients compute the same | Fixed — loopback-validated (`test_brokered_over_rotating_rendezvous_address`); §9.2 corrected to a shared-guest rendezvous (per-party ECDH addresses can't be pre-bound) |
 
 Verdicts: implementation faithful on the crypto/wire core, now faithful on the
 firewall/valid-set enforcement and broker keepalives too; protocol design sound.
@@ -289,6 +289,14 @@ against the vectors). It found five more, now fixed:
 | LOW-4 | §9.4 `MAX_BRIDGES_PER_CLIENT` and `CONNECT_TIMEOUT` unimplemented | per-client bridge counter/cap; `wait_for(CONNECT_TIMEOUT)` in `connect()` |
 | LOW-5 | a wedged client holding `_Control.lock` across `drain()` could stall MATCH_OFFERs | bound the control write with `WRITE_TIMEOUT` |
 
-Only L8 (computed §9.2 broker rendezvous addresses) remains open — a feature,
-not a bug. Re-review re-verdict: faithful on everything that matters; design
-sound; nothing material outstanding.
+Re-review re-verdict: faithful on everything that matters; design sound;
+nothing material outstanding.
+
+**L8 done (after the re-review):** the broker now serves at a rotating computed
+rendezvous address (`broker.rendezvous_address`, `BrokerEndpoint`; freebind +
+per-bucket rotation, mirroring the daemon), and clients compute the same address
+to reach it. §9.2 was corrected to a shared-guest rendezvous keyed from the
+semi-public `guest_prior` (the original per-party ECDH address is impractical —
+the broker can't pre-bind an address for an initiator whose key it doesn't yet
+know). Validated on loopback; the real-address path reuses the M4-proven
+AnyIP + freebind mechanism. The whole review-and-fix loop is now closed.
