@@ -2,20 +2,16 @@
 """Broker: control/data-split rendezvous for NAT-blocked participants
 (spec §7.5, §8.3, §9).
 
-A registered client (responder) holds a persistent **control** connection and
-receives MATCH_OFFERs on it. An initiator opens a connection, sends CONNECT,
-and waits. On a match the broker sends the responder a MATCH_OFFER with a
-single-use match_id; the responder dials back a fresh **data** connection with
-ACCEPT{match_id}; the broker sends MATCHED to both and then relays raw bytes
-between them. The end-to-end Montauk handshake runs through that bridge, so the
-broker only ever sees ciphertext and cannot replay it (the header is
-prologue-bound, §4.4).
+Each party opens a Noise-authenticated link to the broker (§8.3), so the broker
+learns its identity cryptographically rather than trusting an asserted value
+(§9.3). Control messages (REGISTER / CONNECT / ACCEPT / responses) flow
+encrypted over that link. On a match the broker relays **raw bytes** between the
+initiator and a responder-dialed data connection; the end-to-end Montauk
+handshake runs through that opaque bridge, so the broker cannot read or replay
+it (the header is prologue-bound, §4.4).
 
-M5 scope note: the client↔broker links are plaintext framed control here.
-Spec §8.3 has them Noise-authenticated to the broker so it learns identities
-cryptographically; that is deferred (see reference_roadmap.md §8). Because of
-that, CONNECT carries the initiator pubkey explicitly and broker authorization
-is a soft first-line filter — the real security is the end-to-end handshake.
+Once the broker sends MATCHED, both ends stop using the broker-link encryption
+and the connection carries raw end-to-end bytes.
 """
 
 import asyncio
@@ -45,15 +41,14 @@ ERROR_TIMEOUT = 0x22
 DIAL_BACK_TIMEOUT = 10  # seconds, §9.4
 
 
-# --- message framing (bodies carried in transport frames, §7.1) ---
+# --- control message bodies (sent encrypted over the broker link) ---
 
 def encode_register(client_pubkey: bytes, authorizations: list[bytes]) -> bytes:
-    body = bytes([REGISTER]) + client_pubkey + len(authorizations).to_bytes(2, "big")
-    return body + b"".join(authorizations)
+    return bytes([REGISTER]) + client_pubkey + len(authorizations).to_bytes(2, "big") + b"".join(authorizations)
 
 
-def encode_connect(target_pubkey: bytes, initiator_pubkey: bytes) -> bytes:
-    return bytes([CONNECT]) + target_pubkey + initiator_pubkey
+def encode_connect(target_pubkey: bytes) -> bytes:
+    return bytes([CONNECT]) + target_pubkey
 
 
 def encode_accept(match_id: bytes) -> bytes:
@@ -67,11 +62,18 @@ def encode_response(rtype: int, payload: bytes = b"") -> bytes:
 @dataclass
 class _Control:
     writer: asyncio.StreamWriter
+    send_cs: object
     authorized: set[bytes]
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def push(self, body: bytes) -> None:
+        async with self.lock:  # serialize cipher-state use across concurrent offers
+            await transport.write_encrypted(self.writer, self.send_cs, body)
 
 
 @dataclass
 class _Pending:
+    target: bytes
     initiator_reader: asyncio.StreamReader
     initiator_writer: asyncio.StreamWriter
     data: asyncio.Future = field(default_factory=asyncio.Future)
@@ -79,8 +81,10 @@ class _Pending:
 
 
 class MontaukBroker:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, static_private: bytes, link_psk: bytes):
         self.host, self.port = host, port
+        self.static_private = static_private
+        self.link_psk = link_psk
         self._clients: dict[bytes, _Control] = {}
         self._pending: dict[bytes, _Pending] = {}
         self._conns: set[asyncio.Task] = set()
@@ -94,7 +98,7 @@ class MontaukBroker:
         if self._server is None:
             return
         self._server.close()
-        for task in list(self._conns):  # abort active bridges/control channels
+        for task in list(self._conns):
             task.cancel()
         with contextlib.suppress(asyncio.TimeoutError, Exception):
             await asyncio.wait_for(self._server.wait_closed(), 3)
@@ -103,68 +107,76 @@ class MontaukBroker:
     async def _on_conn(self, reader, writer):
         self._conns.add(asyncio.current_task())
         try:
-            body = await transport.read_frame(reader)
+            send_cs, recv_cs, party = await transport.do_broker_link_responder(
+                reader, writer, static_private=self.static_private, psk=self.link_psk
+            )
+            body = await transport.read_encrypted(reader, recv_cs)
             if not body:
                 writer.close()
                 return
             mtype = body[0]
             if mtype == REGISTER:
-                await self._handle_register(body, reader, writer)
+                await self._handle_register(body, party, reader, writer, send_cs, recv_cs)
             elif mtype == CONNECT:
-                await self._handle_connect(body, reader, writer)
+                await self._handle_connect(body, party, reader, writer, send_cs, recv_cs)
             elif mtype == ACCEPT:
-                await self._handle_accept(body, reader, writer)
+                await self._handle_accept(body, party, reader, writer, send_cs)
             else:
                 writer.close()
-        except Exception as exc:  # never let one connection take down the broker
+        except Exception as exc:
             log.debug("broker connection error: %s", exc)
             writer.close()
         finally:
             self._conns.discard(asyncio.current_task())
 
-    async def _handle_register(self, body, reader, writer):
-        pubkey = body[1:33]
+    async def _handle_register(self, body, party, reader, writer, send_cs, recv_cs):
+        client_pubkey = body[1:33]
+        if client_pubkey != party:  # the asserted key must match the authenticated one (§9.3)
+            writer.close()
+            return
         n = int.from_bytes(body[33:35], "big")
         off = 35
         authorized = {body[off + i * 32 : off + i * 32 + 32] for i in range(n)}
-        self._clients[pubkey] = _Control(writer, authorized)
-        await transport.write_frame(writer, encode_response(REGISTERED))
-        log.info("registered %s (%d authorized)", pubkey.hex()[:8], len(authorized))
+        control = _Control(writer, send_cs, authorized)
+        self._clients[party] = control
+        await control.push(encode_response(REGISTERED))
+        log.info("registered %s (%d authorized)", party.hex()[:8], len(authorized))
         try:
-            while True:  # keep control channel open; drain keepalives until EOF
-                if await transport.read_frame(reader) is None:
+            while True:  # keep control channel open; drain encrypted keepalives
+                if await transport.read_encrypted(reader, recv_cs) is None:
                     break
         finally:
-            if self._clients.get(pubkey) is not None and self._clients[pubkey].writer is writer:
-                del self._clients[pubkey]
+            if self._clients.get(party) is control:
+                del self._clients[party]
             writer.close()
 
-    async def _handle_connect(self, body, reader, writer):
-        target, initiator = body[1:33], body[33:65]
+    async def _handle_connect(self, body, party, reader, writer, send_cs, recv_cs):
+        target = body[1:33]
         chan = self._clients.get(target)
         if chan is None:
-            await transport.write_frame(writer, encode_response(ERROR_NOT_FOUND))
+            await transport.write_encrypted(writer, send_cs, encode_response(ERROR_NOT_FOUND))
             writer.close()
             return
-        if initiator not in chan.authorized:
-            await transport.write_frame(writer, encode_response(ERROR_UNAUTHORIZED))
+        if party not in chan.authorized:  # `party` is the authenticated initiator (§9.3)
+            await transport.write_encrypted(writer, send_cs, encode_response(ERROR_UNAUTHORIZED))
             writer.close()
             return
         match_id = os.urandom(16)
-        pending = _Pending(reader, writer)
+        pending = _Pending(target, reader, writer)
         self._pending[match_id] = pending
-        await transport.write_frame(chan.writer, encode_response(MATCH_OFFER, match_id))
-        await transport.write_frame(writer, encode_response(WAITING))
+        await chan.push(encode_response(MATCH_OFFER, match_id))
+        await transport.write_encrypted(writer, send_cs, encode_response(WAITING))
         try:
-            data_reader, data_writer = await asyncio.wait_for(pending.data, DIAL_BACK_TIMEOUT)
+            data_reader, data_writer, data_send_cs = await asyncio.wait_for(pending.data, DIAL_BACK_TIMEOUT)
         except asyncio.TimeoutError:
             self._pending.pop(match_id, None)
-            await transport.write_frame(writer, encode_response(ERROR_TIMEOUT))
+            await transport.write_encrypted(writer, send_cs, encode_response(ERROR_TIMEOUT))
             writer.close()
             return
-        # Both ends present: signal MATCHED and bridge raw bytes end to end.
-        await transport.write_frame(writer, encode_response(MATCHED))
-        await transport.write_frame(data_writer, encode_response(MATCHED))
+        # Both ends present: send MATCHED (last encrypted frame each way), then
+        # relay raw end-to-end bytes.
+        await transport.write_encrypted(writer, send_cs, encode_response(MATCHED))
+        await transport.write_encrypted(data_writer, data_send_cs, encode_response(MATCHED))
         log.info("bridging match %s (target %s)", match_id.hex()[:8], target.hex()[:8])
         try:
             await _bridge(reader, writer, data_reader, data_writer)
@@ -173,21 +185,19 @@ class MontaukBroker:
             if not pending.finished.done():
                 pending.finished.set_result(True)
 
-    async def _handle_accept(self, body, reader, writer):
+    async def _handle_accept(self, body, party, reader, writer, send_cs):
         match_id = body[1:17]
         pending = self._pending.get(match_id)
-        if pending is None or pending.data.done():
-            await transport.write_frame(writer, encode_response(ERROR_NOT_FOUND))
+        if pending is None or pending.data.done() or party != pending.target:
+            await transport.write_encrypted(writer, send_cs, encode_response(ERROR_NOT_FOUND))
             writer.close()
             return
-        pending.data.set_result((reader, writer))
-        # Hold this coroutine (and the data connection) open until the bridge ends.
-        await pending.finished
+        pending.data.set_result((reader, writer, send_cs))
+        await pending.finished  # hold the data connection open until the bridge ends
 
 
 async def _bridge(r1, w1, r2, w2):
-    """Relay opaque bytes both ways until either side EOFs. The broker never
-    parses or decrypts these bytes (§9.4)."""
+    """Relay opaque bytes both ways until either side EOFs (§9.4)."""
 
     async def pipe(src, dst):
         try:
@@ -209,18 +219,26 @@ async def _bridge(r1, w1, r2, w2):
 
 # --- client-side helpers ---
 
-async def register(broker_host, broker_port, client_pubkey, authorizations, on_offer):
-    """Register as a client and dispatch each MATCH_OFFER's match_id to
-    on_offer(match_id). Blocks holding the control connection until it drops."""
+async def _open_link(broker_host, broker_port, static_private, broker_pubkey, link_psk):
     reader, writer = await asyncio.open_connection(broker_host, broker_port)
-    await transport.write_frame(writer, encode_register(client_pubkey, list(authorizations)))
-    resp = await transport.read_frame(reader)
+    send_cs, recv_cs = await transport.do_broker_link_initiator(
+        reader, writer, static_private=static_private, remote_static=broker_pubkey, psk=link_psk
+    )
+    return reader, writer, send_cs, recv_cs
+
+
+async def register(broker_host, broker_port, static_private, broker_pubkey, link_psk, client_pubkey, authorizations, on_offer):
+    """Register as a client and dispatch each MATCH_OFFER to on_offer(match_id).
+    Blocks holding the control connection until it drops."""
+    reader, writer, send_cs, recv_cs = await _open_link(broker_host, broker_port, static_private, broker_pubkey, link_psk)
+    await transport.write_encrypted(writer, send_cs, encode_register(client_pubkey, list(authorizations)))
+    resp = await transport.read_encrypted(reader, recv_cs)
     if not resp or resp[0] != REGISTERED:
         writer.close()
         raise RuntimeError("broker did not register us")
     try:
         while True:
-            frame = await transport.read_frame(reader)
+            frame = await transport.read_encrypted(reader, recv_cs)
             if frame is None:
                 break
             if frame[0] == MATCH_OFFER:
@@ -229,32 +247,32 @@ async def register(broker_host, broker_port, client_pubkey, authorizations, on_o
         writer.close()
 
 
-async def dial_back(broker_host, broker_port, match_id):
-    """Open a data connection claiming a match; returns the bridged
-    (reader, writer) to run the responder handshake over."""
-    reader, writer = await asyncio.open_connection(broker_host, broker_port)
-    await transport.write_frame(writer, encode_accept(match_id))
-    resp = await transport.read_frame(reader)
+async def dial_back(broker_host, broker_port, static_private, broker_pubkey, link_psk, match_id):
+    """Claim a match with a fresh data connection; returns the raw (reader,
+    writer) to run the responder handshake over once MATCHED."""
+    reader, writer, send_cs, recv_cs = await _open_link(broker_host, broker_port, static_private, broker_pubkey, link_psk)
+    await transport.write_encrypted(writer, send_cs, encode_accept(match_id))
+    resp = await transport.read_encrypted(reader, recv_cs)
     if not resp or resp[0] != MATCHED:
         writer.close()
         raise RuntimeError(f"dial-back not matched: {resp!r}")
-    return reader, writer
+    return reader, writer  # subsequent bytes are raw end-to-end
 
 
-async def connect(broker_host, broker_port, target_pubkey, initiator_pubkey):
-    """Request a target through the broker; returns the bridged (reader, writer)
-    to run the initiator handshake over once MATCHED."""
-    reader, writer = await asyncio.open_connection(broker_host, broker_port)
-    await transport.write_frame(writer, encode_connect(target_pubkey, initiator_pubkey))
+async def connect(broker_host, broker_port, static_private, broker_pubkey, link_psk, target_pubkey):
+    """Request a target; returns the raw (reader, writer) to run the initiator
+    handshake over once MATCHED."""
+    reader, writer, send_cs, recv_cs = await _open_link(broker_host, broker_port, static_private, broker_pubkey, link_psk)
+    await transport.write_encrypted(writer, send_cs, encode_connect(target_pubkey))
     while True:
-        resp = await transport.read_frame(reader)
+        resp = await transport.read_encrypted(reader, recv_cs)
         if resp is None:
             writer.close()
             raise RuntimeError("broker closed before match")
         if resp[0] == WAITING:
             continue
         if resp[0] == MATCHED:
-            return reader, writer
+            return reader, writer  # subsequent bytes are raw end-to-end
         writer.close()
         raise BrokerError(resp[0])
 
@@ -268,8 +286,10 @@ class BrokerError(Exception):
 
 # --- brokered responder / initiator glue (used by tests and the M5 harness) ---
 
-async def _serve_offer(broker_host, broker_port, match_id, identity, relationship, nonce_cache):
-    reader, writer = await dial_back(broker_host, broker_port, match_id)
+async def _serve_offer(broker_host, broker_port, match_id, identity, relationship, nonce_cache, broker_pubkey, link_psk):
+    reader, writer = await dial_back(
+        broker_host, broker_port, identity.static_private, broker_pubkey, link_psk, match_id
+    )
     target_writer = None
     try:
         send_cs, recv_cs, service_id = await transport.do_responder_handshake(
@@ -290,21 +310,28 @@ async def _serve_offer(broker_host, broker_port, match_id, identity, relationshi
         target_writer.close()
 
 
-async def serve_brokered_responder(broker_host, broker_port, identity, relationship):
+async def serve_brokered_responder(broker_host, broker_port, identity, relationship, broker_pubkey, link_psk):
     """Register and serve brokered connections until cancelled: each MATCH_OFFER
     spawns a dial-back + responder handshake + proxy to the matched service."""
     nonce_cache = wire.NonceCache()
 
     async def on_offer(match_id):
-        asyncio.create_task(_serve_offer(broker_host, broker_port, match_id, identity, relationship, nonce_cache))
+        asyncio.create_task(
+            _serve_offer(broker_host, broker_port, match_id, identity, relationship, nonce_cache, broker_pubkey, link_psk)
+        )
 
-    await register(broker_host, broker_port, identity.static_public, [relationship.peer_pubkey], on_offer)
+    await register(
+        broker_host, broker_port, identity.static_private, broker_pubkey, link_psk,
+        identity.static_public, [relationship.peer_pubkey], on_offer,
+    )
 
 
-async def connect_brokered(broker_host, broker_port, identity, relationship, service_id):
+async def connect_brokered(broker_host, broker_port, identity, relationship, service_id, broker_pubkey, link_psk):
     """Initiator: reach the peer through the broker and complete the end-to-end
     handshake over the bridge. Returns (send_cs, recv_cs, reader, writer)."""
-    reader, writer = await connect(broker_host, broker_port, relationship.peer_pubkey, identity.static_public)
+    reader, writer = await connect(
+        broker_host, broker_port, identity.static_private, broker_pubkey, link_psk, relationship.peer_pubkey
+    )
     send_cs, recv_cs = await transport.do_initiator_handshake(
         reader, writer, identity=identity, relationship=relationship, service_id=service_id, brokered=True
     )

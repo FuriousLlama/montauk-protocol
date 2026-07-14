@@ -196,20 +196,26 @@ implementation-defined.
 | 5 | IK authenticates the initiator's static key cryptographically, but the spec never says the responder MUST verify that key equals the relationship's `peer_pubkey`. The reference does (and closes silently on mismatch); without it, a party holding a *different* valid relationship's PSK is not bound to a specific identity. Surfaced building M1. | §8.2 should state the responder MUST bind the authenticated static key to the relationship | Closed — v0.4.0-draft §8.2, §12.1 |
 | 6 | Graceful connection close / half-close of the proxied stream is undefined. The reference maps TCP FIN through the channel (write_eof each direction); the spec says nothing about how stream end is signaled or whether half-open is allowed. | §8.2 close semantics note | Closed — v0.4.0-draft §8.2 |
 | 7 | On IPv6 the AnyIP `local` route is not sufficient to *bind* a computed address — the socket must also set `IPV6_FREEBIND`. Confirmed on real hosts in M4. Route enables delivery; FREEBIND enables bind. | §6.3 / deployment note | Closed — v0.4.0-draft §6.3, §12.1 |
-| 8 | The daemon has no signal handler, so `close()` (which deletes the nft table) is not called on SIGTERM/SIGKILL. Crash safety then rests entirely on the per-element timeouts (validated in M4: a killed daemon leaves holes that auto-expire). A graceful `SIGTERM → close()` handler is desirable but not required for safety. | Implementation note | Spec resolved — v0.4.0-draft §12.4; impl SIGTERM handler still to add |
-| 9 | M5 broker links (client↔broker, initiator↔broker) are plaintext framed control, not Noise-authenticated as spec §8.3 shows. So the broker learns identities from message contents (CONNECT carries the initiator pubkey) and authorization is a soft first-line filter; the real security is the end-to-end handshake through the bridge, which the broker cannot read or replay. Faithful Noise-to-broker links are a v0.x refinement. | §8.3 / §9 — reference deviation to close | Spec clarified — v0.4.0-draft §9.3; reference impl still to align (Noise broker links) |
+| 8 | The daemon has no signal handler, so `close()` (which deletes the nft table) is not called on SIGTERM/SIGKILL. Crash safety then rests entirely on the per-element timeouts (validated in M4: a killed daemon leaves holes that auto-expire). A graceful `SIGTERM → close()` handler is desirable but not required for safety. | Implementation note | Closed — v0.4.0-draft §12.4; `MontaukDaemon.serve_forever()` SIGTERM cleanup validated on the testbed (nft table deleted on stop, not just expiring) |
+| 9 | M5 broker links (client↔broker, initiator↔broker) are plaintext framed control, not Noise-authenticated as spec §8.3 shows. So the broker learns identities from message contents (CONNECT carries the initiator pubkey) and authorization is a soft first-line filter; the real security is the end-to-end handshake through the bridge, which the broker cannot read or replay. Faithful Noise-to-broker links are a v0.x refinement. | §8.3 / §9 — reference deviation to close | Closed — spec v0.4.0-draft §9.3; impl now does Noise-authenticated broker links (`transport.do_broker_link_*`, `BROKER_PROLOGUE`); identities come from the handshake, CONNECT no longer asserts an initiator key; validated cross-host (M5 PASS) |
 
 Add to this table as they surface; every closed entry cites the spec
 version that resolved it.
 
 ## 9. Definition of Done (v1)
 
-- M0–M4 complete (M5 broker may trail)
-- Every MUST in §12.1 has a passing, section-named test
-- A second machine, following only `docs/deployment.md`, can be brought
-  from zero to an SSH-over-Montauk connection
-- The Section 8 table above is empty of open entries, each resolved by a
-  spec patch or an explicit implementation-defined note
+- [x] M0–M5 complete (all milestones, including the broker)
+- [x] The Section 8 table above is empty of open entries — all 9 closed
+- [x] Direct connection driven by the `montauk` CLI (`pair`/`serve`/`connect`)
+      cross-host on the testbed: HTTP 200 through the forward, real computed
+      addresses, nft firewall, graceful cleanup
+- [~] Every MUST in §12.1 has a passing, section-named test — most are covered
+      (golden vectors, prologue, payload rules, framing, timestamp/nonce,
+      window); a line-by-line §12.1 audit is still worth doing
+- [ ] Remaining: brokered reachability wired into the `serve`/`connect` card
+      flow (the broker itself and the brokered client/initiator glue exist and
+      are validated via `harness/m5_node.py`); a `montauk.cli` `--user`-mode
+      SIGTERM audit on non-systemd hosts
 
 ## 10. Proxmox Testbed (M4/M5)
 

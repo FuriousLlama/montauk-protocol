@@ -10,8 +10,8 @@ import asyncio
 import os
 import time
 
-from .core import noise, wire
-from .core.constants import MAX_FRAME_BODY, VERSION
+from .core import crypto, noise, wire
+from .core.constants import BROKER_PROLOGUE, MAX_FRAME_BODY, VERSION
 from .core.errors import FrameError, HandshakeError
 from .core.model import Identity, Relationship, ValidSetEntry
 
@@ -117,6 +117,46 @@ async def do_responder_handshake(
     send_cs, recv_cs = hs.split()
     service_id = payload1 if brokered else entry.service_id
     return send_cs, recv_cs, service_id
+
+
+async def do_broker_link_initiator(reader, writer, *, static_private, remote_static, psk):
+    """Authenticated Noise handshake to the broker (party is initiator), so the
+    broker learns the party's identity cryptographically (§8.3). Returns the
+    (send, recv) cipher states for the encrypted control channel."""
+    hs = noise.Handshake(
+        initiator=True, prologue=BROKER_PROLOGUE, static_private=static_private, psk=psk, remote_static=remote_static
+    )
+    await write_frame(writer, hs.write_message(b""))
+    m2 = await read_frame(reader)
+    if m2 is None:
+        raise HandshakeError("no broker link response")
+    hs.read_message(m2)
+    return hs.split()
+
+
+async def do_broker_link_responder(reader, writer, *, static_private, psk):
+    """Broker side of the link handshake. Returns (send, recv, party_static),
+    where party_static is the party's authenticated identity."""
+    m1 = await read_frame(reader)
+    if m1 is None:
+        raise HandshakeError("no broker link hello")
+    hs = noise.Handshake(initiator=False, prologue=BROKER_PROLOGUE, static_private=static_private, psk=psk)
+    hs.read_message(m1)
+    await write_frame(writer, hs.write_message(b""))
+    send_cs, recv_cs = hs.split()
+    return send_cs, recv_cs, hs.remote_static
+
+
+async def read_encrypted(reader, recv_cs) -> bytes | None:
+    """Read and decrypt one control frame; None on EOF."""
+    frame = await read_frame(reader)
+    if frame is None:
+        return None
+    return recv_cs.decrypt(b"", frame)
+
+
+async def write_encrypted(writer, send_cs, body: bytes) -> None:
+    await write_frame(writer, send_cs.encrypt(b"", body))
 
 
 def _safe_write_eof(writer: asyncio.StreamWriter) -> None:

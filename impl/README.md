@@ -13,9 +13,24 @@ enforce the ±30s FirstPacket timestamp window.
 
 ```
 uv sync
-uv run pytest                                  # 51 tests: vectors, core, e2e, rotation
+uv run pytest                                  # 62 tests: vectors, core, e2e, rotation, broker, cli
 uv run python examples/direct_forward_demo.py  # watch a request cross the channel
 ```
+
+## CLI
+
+```
+uv run montauk pair --responder-prefix 2001:db8:1234:5678::/64 \
+    --service ssh=127.0.0.1:22 --out-responder bob.json --out-initiator alice.json
+sudo uv run montauk serve bob.json                    # responder (AnyIP + nft firewall)
+uv run montauk connect alice.json ssh -L 127.0.0.1:8022
+uv run montauk broker --listen 0.0.0.0:9000 --key <hex> --psk <hex>
+uv run montauk status bob.json                        # current computed tuples
+```
+
+For rootless local testing, `serve --bind-host ::1` and `connect --connect-host ::1`
+use loopback (computed ports only, no firewall). See
+[docs/deployment.md](../docs/deployment.md) for real deployment.
 
 ## Layout
 

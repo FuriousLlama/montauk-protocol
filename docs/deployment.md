@@ -32,10 +32,18 @@ here.
 
 Both parties need the same relationship material — public keys, Prior,
 handshake password, the responder's prefix, and the service definitions —
-exchanged over a secure out-of-band channel (spec §8.1). In the reference
-impl this is a `Relationship` on each side (see `montauk/pairing.py` for how
-both halves are minted; `harness/m4_node.py` derives everything from one
-shared seed for testing).
+exchanged over a secure out-of-band channel (spec §8.1). Each party persists
+its half as a **card** (JSON). To bootstrap a matched pair:
+
+```
+montauk pair --responder-prefix 2001:db8:1234:5678::/64 \
+             --service ssh=127.0.0.1:22 \
+             --out-responder bob.json --out-initiator alice.json
+```
+
+`bob.json` goes to the responder host, `alice.json` to the initiator. In a real
+deployment you would generate each identity locally (`montauk keygen`) and
+exchange only public material out of band; `pair` is the convenience path.
 
 ## 3. Responder
 
@@ -48,17 +56,18 @@ sudo ip -6 route add local 2001:db8:1234:5678::/64 dev eth0
 
 **b. Run the daemon.** It binds the rotating computed addresses (with
 `IPV6_FREEBIND`) and installs the nftables firewall itself. Run it as a
-**systemd unit** so it survives your session — do *not* `nohup … &` over ssh
-(SIGHUP kills it):
+**systemd unit** so it survives your session and cleans up on stop — do *not*
+`nohup … &` over ssh (SIGHUP kills it):
 
 ```
 sudo systemd-run --unit=montauk-responder \
   --working-directory=/opt/montauk/impl \
-  /opt/montauk/impl/.venv/bin/python -m montauk.cli serve ...
+  /opt/montauk/impl/.venv/bin/montauk serve /etc/montauk/bob.json
 ```
 
-(The M4 testbed used `harness/m4_node.py responder`; a `montauk.cli serve`
-entrypoint is a to-do.) The daemon:
+On `systemctl stop`, the daemon catches SIGTERM and removes its firewall table
+and listeners; a crash instead relies on the per-tuple timeouts to expire the
+holes (both fail closed). The daemon:
 
 - binds `current ±1` bucket tuples (3 listeners), rotating every 5 minutes;
 - installs `table ip6 montauk` with a default-drop on the prefix and an
@@ -85,9 +94,12 @@ sudo ip -6 route add 2001:db8:1234:5678::/64 via <responder-address> dev eth0
 a fresh Montauk connection to the peer's current computed tuple.
 
 ```
-python -m montauk.cli connect <relationship> <service> -L 127.0.0.1:8022
+montauk connect alice.json ssh -L 127.0.0.1:8022
 ssh -p 8022 127.0.0.1        # e.g. SSH over Montauk
 ```
+
+`montauk status bob.json` on the responder prints the currently-valid tuples if
+you want to confirm both sides agree.
 
 ## 5. What you should observe
 
@@ -130,6 +142,15 @@ ssh -p 8022 127.0.0.1        # e.g. SSH over Montauk
 ## 8. Brokered / NAT deployment
 
 For participants behind NAT, a broker bridges connections without being able
-to decrypt them (spec §9). This lands with M5; the pattern is a third host
-running `montauk.cli broker`, with clients registering and initiators
-connecting through it. See `reference_roadmap.md` §10 for the testbed shape.
+to decrypt them (spec §9). Run a broker on a reachable third host:
+
+```
+montauk broker --listen 0.0.0.0:9000 --key <hex> --psk <hex>
+```
+
+Clients open Noise-authenticated links to the broker; an initiator's request is
+matched to a registered responder, which dials back a data connection, and the
+broker relays raw bytes while the end-to-end handshake runs through the bridge.
+The brokered client/initiator flow is exercised by `harness/m5_node.py` and
+validated cross-host (roadmap §10); wiring brokered reachability into the
+`serve`/`connect` card flow is the remaining CLI step.

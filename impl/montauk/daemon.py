@@ -11,6 +11,7 @@ computed port is used.
 import asyncio
 import contextlib
 import logging
+import signal
 import socket
 
 from . import transport
@@ -79,6 +80,22 @@ class MontaukDaemon:
         await self.firewall.start()
         await self.sync()
         self._rotation_task = asyncio.create_task(self._rotation_loop()) if rotate else None
+
+    async def serve_forever(self, *, rotate: bool = True) -> None:
+        """Start and run until SIGTERM/SIGINT, then close() so the firewall
+        table and listeners are removed on graceful shutdown (§12.4). A crash
+        that skips this still fails closed via the valid-set timeouts (§11.6)."""
+        await self.start(rotate=rotate)
+        loop = asyncio.get_running_loop()
+        stop = loop.create_future()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, ValueError):
+                loop.add_signal_handler(sig, lambda: stop.done() or stop.set_result(None))
+        try:
+            await stop
+        finally:
+            log.info("shutting down; removing firewall state and listeners")
+            await self.close()
 
     def _delay_until_next_sync(self, now: int) -> int:
         """Seconds to sleep before the next re-sync (always 1..BUCKET_DURATION)."""

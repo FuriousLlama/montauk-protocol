@@ -8,6 +8,9 @@ license = "Apache-2.0"
 authors = [{ name = "Manuel Rodriguez", email = "manuel.rodriguez@teknios.tech" }]
 dependencies = ["cryptography>=42"]
 
+[project.scripts]
+montauk = "montauk.cli:main"
+
 [dependency-groups]
 dev = ["pytest>=8", "hypothesis>=6"]
 

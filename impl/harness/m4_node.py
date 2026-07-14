@@ -80,11 +80,9 @@ async def run_responder(args) -> int:
     identity = Identity.from_private(resp_priv, prefix)
     rel = Relationship(peer_pubkey=crypto.public_key(init_priv), **common)
     daemon = MontaukDaemon(identity, [rel], freebind=True, firewall=NftablesFirewall(prefix))
-    await daemon.start()
-    tuples = [f"[{a}]:{p}" for _, _, a, p in daemon.current_tuples()]
-    print(f"[responder] daemon up on {prefix}; live tuples: {tuples}", flush=True)
-    while True:
-        await asyncio.sleep(3600)
+    print(f"[responder] starting on {prefix}; origin 127.0.0.1:{ORIGIN_PORT}", flush=True)
+    await daemon.serve_forever()  # logs listeners; removes firewall on SIGTERM
+    return 0
 
 
 async def _connect_state(host: str, port: int, timeout: float) -> str:

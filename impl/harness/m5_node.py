@@ -39,6 +39,8 @@ def build(seed_hex: str):
     seed = bytes.fromhex(seed_hex)
     resp_priv = kdf(seed, b"responder-key")
     init_priv = kdf(seed, b"initiator-key")
+    broker_priv = kdf(seed, b"broker-key")
+    link_psk = kdf(seed, b"broker-psk")
     service = ServiceDefinition(kdf(seed, b"service", 16), "web", 0x01, f"127.0.0.1:{ORIGIN_PORT}")
     # Reachability is unused by the brokered path; a placeholder prefix keeps
     # the Relationship valid.
@@ -51,7 +53,7 @@ def build(seed_hex: str):
         services=(service,),
         created_at=0,
     )
-    return resp_priv, init_priv, service, common
+    return resp_priv, init_priv, broker_priv, link_psk, service, common
 
 
 def parse_hostport(s: str) -> tuple[str, int]:
@@ -73,7 +75,8 @@ async def start_origin() -> None:
 
 
 async def run_broker(args) -> int:
-    bkr = broker.MontaukBroker(args.host, args.port)
+    _, _, broker_priv, link_psk, _, _ = build(args.seed)
+    bkr = broker.MontaukBroker(args.host, args.port, broker_priv, link_psk)
     host, port = await bkr.start()
     print(f"[broker] listening on {host}:{port}", flush=True)
     while True:
@@ -81,24 +84,26 @@ async def run_broker(args) -> int:
 
 
 async def run_responder(args) -> int:
-    resp_priv, init_priv, service, common = build(args.seed)
+    resp_priv, init_priv, broker_priv, link_psk, service, common = build(args.seed)
     await start_origin()
     identity = Identity.from_private(resp_priv, None)
     rel = Relationship(peer_pubkey=crypto.public_key(init_priv), **common)
     bhost, bport = parse_hostport(args.broker)
+    broker_pub = crypto.public_key(broker_priv)
     print(f"[responder] registering with broker {bhost}:{bport}; origin on 127.0.0.1:{ORIGIN_PORT}", flush=True)
-    await broker.serve_brokered_responder(bhost, bport, identity, rel)
+    await broker.serve_brokered_responder(bhost, bport, identity, rel, broker_pub, link_psk)
     return 0
 
 
 async def run_initiator(args) -> int:
-    resp_priv, init_priv, service, common = build(args.seed)
+    resp_priv, init_priv, broker_priv, link_psk, service, common = build(args.seed)
     identity = Identity.from_private(init_priv, None)
     rel = Relationship(peer_pubkey=crypto.public_key(resp_priv), **common)
     bhost, bport = parse_hostport(args.broker)
+    broker_pub = crypto.public_key(broker_priv)
     print(f"[initiator] connecting through broker {bhost}:{bport} ...", flush=True)
     send_cs, recv_cs, reader, writer = await asyncio.wait_for(
-        broker.connect_brokered(bhost, bport, identity, rel, service.service_id), 15
+        broker.connect_brokered(bhost, bport, identity, rel, service.service_id, broker_pub, link_psk), 15
     )
     print("[initiator] bridged + handshake done; sending GET", flush=True)
     await transport.write_frame(writer, send_cs.encrypt(b"", b"GET / HTTP/1.0\r\nHost: montauk\r\n\r\n"))
