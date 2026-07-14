@@ -1,9 +1,10 @@
 ---
 title: "The Montauk Protocol"
 author: "Manuel Rodriguez (manuel.rodriguez@teknios.tech)"
-version: "0.3.0-draft"
+version: "0.4.0-draft"
 status: "Draft Specification"
-date: "2026-07-06"
+date: "2026-07-09"
+license: "CC BY 4.0 (test vectors: CC0 1.0)"
 ---
 
 # The Montauk Protocol
@@ -394,6 +395,8 @@ Where:
 
 The responder MUST ensure the advertised prefix actually routes to it (typically by advertising the /64 of the network segment the Montauk Server occupies). A shorter prefix leaves more derived bits and therefore a larger unauthorized search space (Section 11.2).
 
+On common IPv6 stacks, making the prefix locally deliverable (e.g. a Linux AnyIP `local` route) is *necessary but not sufficient* to bind an individual computed address: the listening socket must additionally opt in to binding a non-assigned address (`IPV6_FREEBIND`, or the equivalent non-local-bind facility). The route enables delivery; the socket option enables the bind. Implementations MUST bind computed addresses without requiring each to be provisioned as an interface address.
+
 Each service in a relationship has its own address stream: the (address, port) tuple an initiator connects to identifies both the relationship and the service, so no in-band service selection is needed for direct connections (Section 7.4), and per-service revocation is enforced at the network layer (Section 8.4).
 
 ### 6.4 Address Window
@@ -595,12 +598,33 @@ Initiator                                         Responder
     |  [Handshake complete]                            |
     |  [Encrypted channel established]                 |
     |                                                  |
+    |                    [Verify peer static == relationship]
     |                    [Address identifies service]  |
     |                    [Proxy to internal service]   |
     |                                                  |
     |<================== Encrypted Data ==============>|
     |                                                  |
 ```
+
+**Responder requirements:**
+
+1. **Peer authentication binding**: The Noise handshake cryptographically
+   authenticates the initiator's static key. The responder MUST verify that
+   this key equals the relationship's `peer_pubkey` and silently close on
+   mismatch (Section 11.5). Selecting the relationship by address and holding
+   the correct PSK is not sufficient on its own to bind a connection to a
+   specific peer identity.
+
+2. **Service availability**: If the selected service's `internal_target` is
+   unavailable, the responder MUST still complete the Noise handshake before
+   closing the connection. Failing earlier would reveal endpoint liveness to an
+   unauthenticated party; after the handshake, liveness is exposed only to the
+   authenticated, authorized peer.
+
+3. **Connection close**: End-of-stream is signaled with a TCP FIN, carried
+   through the encrypted channel in each direction independently (half-close is
+   permitted). Closing one direction MUST NOT force the other closed until it
+   also reaches end-of-stream.
 
 ### 8.3 Brokered Connection
 
@@ -741,6 +765,14 @@ if initiator_pubkey in authorization_table[target_pubkey]:
 else:
     reject with ERROR_UNAUTHORIZED
 ```
+
+`initiator_pubkey` MUST be the static key the initiator **authenticated with**
+in its Noise handshake to the broker (Section 8.3), not a value it asserts in a
+message — otherwise a client could claim any identity and the authorization
+check would be meaningless. Likewise `client_pubkey` at registration is the
+key the client authenticated with. The broker's authorization is a first-line
+filter; end-to-end security still rests on the initiator↔responder handshake
+through the bridge, which the broker cannot read or replay.
 
 ### 9.4 Match Protocol and Timeouts
 
@@ -916,6 +948,12 @@ Servers MUST validate first packet timestamps:
 2. Reject packets outside window
 3. Default tolerance: 30 seconds (RECOMMENDED), configurable per-relationship
 
+Timestamp validity and address-bucket validity (Section 6.4) are **independent
+checks with different tolerances**: the address window is ±BUCKET_DURATION
+(±300 s default) while the timestamp window is ±30 s default. A packet can
+therefore arrive on a still-valid previous- or next-bucket address yet be
+rejected on its timestamp. Both checks MUST pass.
+
 ### 11.4 Nonce Tracking
 
 Servers MUST track recently seen nonces:
@@ -936,6 +974,16 @@ Servers MUST NOT send responses to invalid connection attempts:
 - Failed handshake: close connection silently
 
 This prevents attackers from distinguishing rejection reasons.
+
+**Scope of silence**: For an address *not* in the valid set the firewall drops
+the SYN, so no TCP handshake occurs and the endpoint is indistinguishable from
+an unused address. For an address *in* the valid set, the kernel completes the
+TCP handshake before the application processes the FirstPacket — so TCP-layer
+liveness of a currently-valid tuple is observable to anyone who reaches it.
+This is acceptable: reaching a valid tuple already requires knowledge of the
+secret. Silent rejection therefore guarantees indistinguishability for invalid
+tuples and reason-indistinguishability (never a distinguishing response) for
+application-layer failures on valid tuples.
 
 ### 11.6 Rate Limiting
 
@@ -974,6 +1022,8 @@ Implementations MUST support:
 - Timestamp validation with configurable tolerance
 - Nonce tracking and replay rejection
 - Address window computation (current ±1 bucket)
+- Binding computed addresses within a routed prefix without per-address interface provisioning (Section 6.3)
+- Verifying the handshake-authenticated peer static key against the relationship (Section 8.2)
 
 ### 12.2 Recommended Features
 
@@ -993,6 +1043,19 @@ For interoperability, implementations MUST:
 - Use big-endian byte order for all multi-byte integers
 - Use the exact constant strings specified (version, info strings)
 - Follow the wire formats exactly as specified
+
+### 12.4 Operational Requirements
+
+- **Tuple collisions**: Distinct (relationship, service, bucket) streams can,
+  with cryptographically negligible probability, compute the same
+  (address, port). An implementation MUST NOT silently double-book a tuple; it
+  SHOULD detect the collision and log it rather than bind two services behind
+  one listener.
+- **Graceful shutdown**: On orderly shutdown an implementation SHOULD remove
+  its firewall state (valid-set entries). Crash safety does not depend on this:
+  each valid-set entry carries a timeout equal to its remaining validity, so a
+  daemon that dies without cleanup leaves entries the kernel expires on its own
+  (Section 11.6). A `SIGTERM`-triggered cleanup is RECOMMENDED.
 - Pass all test vectors (Section 13)
 
 ---
@@ -1195,6 +1258,8 @@ The First Packet frame body is 137 bytes (wire_format = 0x0089 || frame_body).
 
 _Note: All test vectors are complete. They were generated with a reference implementation whose X25519 is validated against RFC 7748 Section 6.1 and whose Noise stack reproduces the official cacophony test vector for Noise_IKpsk2_25519_ChaChaPoly_SHA256 byte-for-byte, including transport messages and handshake hash._
 
+_The test vectors in this section are dedicated to the public domain under CC0 1.0: use them in any implementation or test suite, no attribution required._
+
 ---
 
 ## 14. References
@@ -1285,6 +1350,20 @@ Each 24-word mnemonic encodes 256 bits—the public key, Prior, and handshake pa
 ---
 
 ## Appendix C: Changelog
+
+### Version 0.4.0-draft (July 2026)
+
+Folds in findings from building and validating the reference implementation
+(M0–M5, including real cross-host and brokered runs). All changes are
+clarifications and added requirements; no wire formats or test vectors change.
+
+- §8.2: the responder MUST verify the handshake-authenticated initiator static key equals the relationship's `peer_pubkey` and close silently on mismatch (address + PSK selection alone does not bind a connection to an identity)
+- §8.2: if a service's `internal_target` is down, the responder MUST still complete the handshake before closing, so liveness is revealed only to an authenticated peer; and connection close is a per-direction TCP FIN carried through the channel (half-close permitted)
+- §11.3: stated that timestamp validity and address-window validity are independent checks with different tolerances, and both must pass
+- §11.5: clarified the scope of silent rejection — invalid tuples are fully indistinguishable, but a currently-valid tuple completes the TCP handshake at the kernel before the application responds (acceptable, since reaching it requires the secret)
+- §6.3, §12.1: binding a computed address requires a non-local-bind facility (`IPV6_FREEBIND`) in addition to the routing prefix; made this a mandatory capability
+- §12.4 (new): implementations MUST NOT silently double-book a colliding tuple, and SHOULD remove firewall state on graceful shutdown (crash safety already rests on valid-set timeouts)
+- §9.3: clarified that broker authorization MUST use the identities parties authenticated with in their Noise handshake to the broker, not values asserted in messages
 
 ### Version 0.3.0-draft (July 2026)
 

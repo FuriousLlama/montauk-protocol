@@ -1,7 +1,7 @@
 ---
 title: "Montauk Reference Implementation Roadmap"
 status: "Living document"
-targets: "montauk_spec.md v0.3.0-draft"
+targets: "montauk_spec.md v0.4.0-draft"
 date: "2026-07-06"
 ---
 
@@ -131,12 +131,12 @@ Each milestone ends with something you can watch work.
 
 | # | Deliverable | Demo / acceptance |
 | - | ----------- | ----------------- |
-| M0 | `impl/` skeleton; crypto + engine + wire as sans-IO modules; golden tests against all §13 vectors; `reference/vectors.json` machine-readable export | Test suite green with zero sockets opened |
-| M1 | Direct connection end-to-end on one machine (AnyIP on loopback, doc prefix) | Client port-forwards to a local HTTP server through a full Montauk handshake |
-| M2 | Live rotation: listener manager + engine diffs on a real clock | Tuples rotate every 5 min; connection succeeds across a bucket boundary; ±skew within tolerance succeeds, outside fails |
-| M3 | nftables sync + adversarial suite in network namespaces | Attacker namespace sweeps the prefix and observes zero responses; valid client connects; daemon kill test shows fail-closed expiry |
-| M4 | Real deployment on an IPv6 host | SSH over Montauk as daily dogfood; `docs/deployment.md` written from the experience |
-| M5 | Broker: control/data split, match_id flow, keepalives, bridging | Three namespaces (initiator, broker, responder) with NAT simulated by masquerade; end-to-end handshake through the bridge |
+| M0 | `impl/` skeleton; crypto + engine + wire as sans-IO modules; golden tests against all §13 vectors; `reference/vectors.json` machine-readable export | Test suite green with zero sockets opened — **done 2026-07-06** (37 tests) |
+| M1 | Direct connection end-to-end on one machine (AnyIP on loopback, doc prefix) | Client port-forwards to a local HTTP server through a full Montauk handshake — **done 2026-07-06** (`examples/direct_forward_demo.py`, 2 e2e tests). Rootless loopback mode; real AnyIP address-binding deferred to M3 |
+| M2 | Live rotation: listener manager + engine diffs on a real clock | Tuples rotate every 5 min; connection succeeds across a bucket boundary; ±skew within tolerance succeeds, outside fails — **done 2026-07-06** (boundary-timed re-sync loop, `test_rotation.py`, 12 tests) |
+| M3 | nftables sync + IPV6_FREEBIND listener; adversarial checks | **done 2026-07-09** — `montauk/firewall.py` (default-drop + timeout set) and freebind listener wired into the daemon (`test_firewall.py`, 56 tests). The adversarial + fail-closed *validation* was done on real hosts in M4 (a more faithful venue than a rootless netns), so no separate netns harness was built |
+| M4 | Real deployment across two hosts | **done 2026-07-09** — two Debian VMs on an isolated IPv6 segment (Proxmox testbed, see §10); responder binds real computed addresses via AnyIP+FREEBIND behind an nftables default-drop; initiator independently computes the tuple and gets HTTP through a full handshake; prefix scan sees only silence; daemon crash leaves holes that auto-expire (`harness/m4_node.py`). `docs/deployment.md` still to be written up |
+| M5 | Broker: control/data split, match_id flow, bridging | **done 2026-07-09** — `montauk/broker.py` + `harness/m5_node.py`; local integration (`test_broker.py`, 3 tests: HTTP through the bridge, unauthorized + unknown-target rejection) and a **cross-host testbed run** (initiator on 902 reaches a broker-only service on 901; end-to-end handshake through the opaque bridge; PASS). Broker links are plaintext control in M5 — see §8 finding 9 |
 
 Rough effort at evenings-and-weekends pace: M0–M1 a few evenings (crypto
 already exists), M2–M3 one to two weeks, M4 mostly ops time, M5 another
@@ -189,10 +189,15 @@ implementation-defined.
 
 | # | Finding | Spec impact | Status |
 | - | ------- | ----------- | ------ |
-| 1 | TCP SYN-ACKs before the application sees a byte, so for the *currently valid* tuple, liveness is confirmed at the kernel layer regardless of application silence. The firewall provides silence for invalid tuples; the application provides only reason-indistinguishability on valid ones. | §11.5 should state this nuance explicitly | Open |
-| 2 | Behavior when a service's `internal_target` is down: close after handshake reveals liveness only to an authenticated, authorized peer. Propose: complete handshake, then close silently; never fail before handshake completion. | §7.4 or §8.2 clarification | Open |
-| 3 | (address, port) collisions across streams on one host are cryptographically negligible but possible; the engine should detect and log rather than silently double-book a tuple. | Implementation-defined; possibly a §12 note | Open |
-| 4 | FirstPacket timestamp validity (§11.3) and address-bucket validity (§6.4) are independent checks; a packet can arrive on a still-valid previous-bucket address with a current timestamp. Needs a test and possibly one clarifying sentence. | §11.3 note | Open |
+| 1 | TCP SYN-ACKs before the application sees a byte, so for the *currently valid* tuple, liveness is confirmed at the kernel layer regardless of application silence. The firewall provides silence for invalid tuples; the application provides only reason-indistinguishability on valid ones. | §11.5 should state this nuance explicitly | Closed — v0.4.0-draft §11.5 |
+| 2 | Behavior when a service's `internal_target` is down: close after handshake reveals liveness only to an authenticated, authorized peer. Propose: complete handshake, then close silently; never fail before handshake completion. | §7.4 or §8.2 clarification | Closed — v0.4.0-draft §8.2 |
+| 3 | (address, port) collisions across streams on one host are cryptographically negligible but possible; the engine should detect and log rather than silently double-book a tuple. | Implementation-defined; possibly a §12 note | Closed — v0.4.0-draft §12.4 |
+| 4 | FirstPacket timestamp validity (§11.3, ±30s) and address-bucket validity (§6.4, ±300s) are independent checks with different tolerances; a packet can reach a still-valid listener yet be rejected on timestamp. Now demonstrated by `test_timestamp_skew_tolerance` (skew=±40s reaches the listener, dropped on timestamp). Spec sentence still wanted. | §11.3 note | Closed — v0.4.0-draft §11.3 |
+| 5 | IK authenticates the initiator's static key cryptographically, but the spec never says the responder MUST verify that key equals the relationship's `peer_pubkey`. The reference does (and closes silently on mismatch); without it, a party holding a *different* valid relationship's PSK is not bound to a specific identity. Surfaced building M1. | §8.2 should state the responder MUST bind the authenticated static key to the relationship | Closed — v0.4.0-draft §8.2, §12.1 |
+| 6 | Graceful connection close / half-close of the proxied stream is undefined. The reference maps TCP FIN through the channel (write_eof each direction); the spec says nothing about how stream end is signaled or whether half-open is allowed. | §8.2 close semantics note | Closed — v0.4.0-draft §8.2 |
+| 7 | On IPv6 the AnyIP `local` route is not sufficient to *bind* a computed address — the socket must also set `IPV6_FREEBIND`. Confirmed on real hosts in M4. Route enables delivery; FREEBIND enables bind. | §6.3 / deployment note | Closed — v0.4.0-draft §6.3, §12.1 |
+| 8 | The daemon has no signal handler, so `close()` (which deletes the nft table) is not called on SIGTERM/SIGKILL. Crash safety then rests entirely on the per-element timeouts (validated in M4: a killed daemon leaves holes that auto-expire). A graceful `SIGTERM → close()` handler is desirable but not required for safety. | Implementation note | Spec resolved — v0.4.0-draft §12.4; impl SIGTERM handler still to add |
+| 9 | M5 broker links (client↔broker, initiator↔broker) are plaintext framed control, not Noise-authenticated as spec §8.3 shows. So the broker learns identities from message contents (CONNECT carries the initiator pubkey) and authorization is a soft first-line filter; the real security is the end-to-end handshake through the bridge, which the broker cannot read or replay. Faithful Noise-to-broker links are a v0.x refinement. | §8.3 / §9 — reference deviation to close | Spec clarified — v0.4.0-draft §9.3; reference impl still to align (Noise broker links) |
 
 Add to this table as they surface; every closed entry cites the spec
 version that resolved it.
@@ -205,3 +210,41 @@ version that resolved it.
   from zero to an SSH-over-Montauk connection
 - The Section 8 table above is empty of open entries, each resolved by a
   spec patch or an explicit implementation-defined note
+
+## 10. Proxmox Testbed (M4/M5)
+
+A two-node testbed on the `proxmox-staging` host (192.168.150.110), fully
+isolated from the LAN. Reproduced from a session; recorded here so it can be
+reused or torn down.
+
+**VMs** (Debian 12 genericcloud, cloud-init, uv-managed Python):
+
+| VMID | Name | Segment IP | Role |
+| ---- | ---- | ---------- | ---- |
+| 901 | montauk-responder | 10.77.0.11 / fd00:6d6f:6e74::11 | AnyIP + nft firewall + daemon + origin |
+| 902 | montauk-initiator | 10.77.0.12 / fd00:6d6f:6e74::12 | client port-forward + adversarial probes |
+
+- **Isolated bridge** `vmbr9` (no uplink). Montauk prefix
+  `2001:db8:1234:5678::/64` is AnyIP-routed on the responder and routed from
+  the initiator via `fd00:6d6f:6e74::11`. Management + WAN (for setup) is
+  IPv4 `10.77.0.0/24` on the same bridge.
+- **Access**: `ssh -J proxmox-staging -i ~/.ssh/nexus_staging montauk@10.77.0.11`
+  (the host is the bastion). Use a **passphrase-less** key — a passphrase-
+  protected key fails in BatchMode with the misleading "accepts key then
+  permission denied".
+- **Run the daemon** as a transient unit so it survives disconnect:
+  `sudo systemd-run --unit=montauk-resp --working-directory=<impl> .venv/bin/python harness/m4_node.py responder --seed <hex> --prefix 2001:db8:1234:5678::/64`.
+  Do **not** background it with `nohup &` over ssh (SIGHUP kills it), and do
+  **not** `pkill -f m4_node.py` (matches your own ssh shell).
+
+**Host changes made for the segment** (reversible; remove when done):
+
+```
+ip link add vmbr9 type bridge; ip addr add 10.77.0.1/24 dev vmbr9   # + fd00:...::1/64
+sysctl -w net.ipv4.ip_forward=1
+nft add table ip montauk_nat ...  # masquerade 10.77.0.0/24 -> eno1
+iptables -I FORWARD -s 10.77.0.0/24 -j ACCEPT   # + -d ...  (Docker sets FORWARD policy DROP)
+```
+
+**Next**: write `docs/deployment.md` from this, and use the third-node
+pattern (add a NAT router VM) for the M5 broker.

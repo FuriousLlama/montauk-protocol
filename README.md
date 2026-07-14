@@ -19,3 +19,17 @@ in [reference/](reference/).
 The roadmap for the reference implementation — architecture, milestones,
 testing strategy, and the running spec-feedback log — is in
 [docs/reference_roadmap.md](docs/reference_roadmap.md).
+
+# License
+
+- **Code** (`reference/`, future implementation directories): copyright 2026
+  Manuel Rodriguez, licensed under the [Apache License 2.0](LICENSE).
+- **Specification text** (`montauk_spec.md`, `docs/`):
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+- **Test vectors** (Section 13 of the spec and generated vector files):
+  dedicated to the public domain under
+  [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
+
+The vendored Noise test vector in `reference/cacophony_ikpsk2.json` comes
+from the [cacophony](https://github.com/haskell-cryptography/cacophony)
+project, which is public domain.

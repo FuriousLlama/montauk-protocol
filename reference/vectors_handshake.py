@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Generates the Montauk spec test vectors for Sections 13.5-13.7.
 
 Implements Noise_IKpsk2_25519_ChaChaPoly_SHA256 (Noise revision 34). Before
@@ -10,7 +11,7 @@ Requires: pip install cryptography
 
 Every value printed here appears verbatim in montauk_spec.md Section 13.
 Regenerate after any change to the handshake (Sections 4.4, 7) and update
-the spec.
+the spec. Run export_vectors.py to refresh the machine-readable vectors.json.
 """
 import hashlib
 import hmac as hmac_mod
@@ -193,54 +194,120 @@ def grouped(b, indent=10):
     return ("\n" + " " * indent).join(lines)
 
 
-# --- Ground truth: reproduce the official cacophony IKpsk2 vector ---
-vec = json.loads((Path(__file__).parent / "cacophony_ikpsk2.json").read_text())["vector"]
-fx = bytes.fromhex
-m1, m2, hh, (i_send, i_recv, r_send, r_recv) = run_handshake(
-    fx(vec["init_prologue"]), fx(vec["init_static"]), fx(vec["init_ephemeral"]),
-    fx(vec["resp_static"]), fx(vec["resp_ephemeral"]), fx(vec["init_psks"][0]),
-    fx(vec["messages"][0]["payload"]), fx(vec["messages"][1]["payload"]),
-)
-assert m1 == fx(vec["messages"][0]["ciphertext"]), "cacophony msg1 mismatch"
-assert m2 == fx(vec["messages"][1]["ciphertext"]), "cacophony msg2 mismatch"
-assert hh == fx(vec["handshake_hash"]), "cacophony handshake hash mismatch"
-for i, msg in enumerate(vec["messages"][2:]):
-    sender = i_send if i % 2 == 0 else r_send
-    assert sender.encrypt(b"", fx(msg["payload"])) == fx(msg["ciphertext"]), f"cacophony transport {i} mismatch"
-print("Noise stack validated against the official cacophony IKpsk2 vector (byte-for-byte)")
+def _validate_against_cacophony():
+    vec = json.loads((Path(__file__).parent / "cacophony_ikpsk2.json").read_text())["vector"]
+    fx = bytes.fromhex
+    m1, m2, hh, (i_send, i_recv, r_send, r_recv) = run_handshake(
+        fx(vec["init_prologue"]), fx(vec["init_static"]), fx(vec["init_ephemeral"]),
+        fx(vec["resp_static"]), fx(vec["resp_ephemeral"]), fx(vec["init_psks"][0]),
+        fx(vec["messages"][0]["payload"]), fx(vec["messages"][1]["payload"]),
+    )
+    assert m1 == fx(vec["messages"][0]["ciphertext"]), "cacophony msg1 mismatch"
+    assert m2 == fx(vec["messages"][1]["ciphertext"]), "cacophony msg2 mismatch"
+    assert hh == fx(vec["handshake_hash"]), "cacophony handshake hash mismatch"
+    for i, msg in enumerate(vec["messages"][2:]):
+        sender = i_send if i % 2 == 0 else r_send
+        assert sender.encrypt(b"", fx(msg["payload"])) == fx(msg["ciphertext"]), f"cacophony transport {i} mismatch"
 
-# --- Montauk transcripts (Sections 13.5-13.7) ---
+
+# Montauk transcript inputs (Sections 13.5-13.7)
+fx = bytes.fromhex
 alice_priv = fx("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
 bob_priv = fx("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
 init_eph = fx("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")  # Section 13.1 key
 resp_eph = fx("404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f")
 psk = fx("606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f")
 service_id = fx("0f0e0d0c0b0a09080706050403020100")
-ts = (1706295600).to_bytes(8, "big")
+TIMESTAMP = 1706295600
+NONCE_DIRECT = bytes(range(16))
+NONCE_BROKERED = bytes(range(16, 32))
 
-print("resp_ephemeral_pub =", pubkey(resp_eph).hex())
 
-for label, section, nonce, p1 in [
-    ("DIRECT", "13.6", bytes(range(16)), b""),
-    ("BROKERED", "13.7", bytes(range(16, 32)), service_id),
-]:
-    prologue = b"\x01" + ts + nonce
-    m1, m2, hh, (i_send, i_recv, r_send, r_recv) = run_handshake(
-        prologue, alice_priv, init_eph, bob_priv, resp_eph, psk, p1, b""
-    )
-    print(f"\n[{section}] {label}")
-    print("  prologue =", prologue.hex())
-    print(f"  noise_message_1 ({len(m1)} bytes) =")
-    print("         ", grouped(m1))
-    print(f"  noise_message_2 ({len(m2)} bytes) =")
-    print("         ", grouped(m2))
-    print("  handshake_hash =")
-    print("         ", grouped(hh))
-    print(f"  first_packet frame body = {25 + len(m1)} bytes (0x{25 + len(m1):04x}), msg2 frame = 0x{len(m2):04x}")
-    if label == "DIRECT":
-        t1 = i_send.encrypt(b"", b"ping")
-        t2 = r_send.encrypt(b"", b"pong")
-        print(f'  transport_1 init->resp "ping" ({len(t1)} bytes) =')
-        print("         ", grouped(t1))
-        print(f'  transport_2 resp->init "pong" ({len(t2)} bytes) =')
-        print("         ", grouped(t2))
+def vectors():
+    """Compute the Section 13.5-13.7 vectors as a structured dict.
+
+    Fail-closed: reproduces the official cacophony IKpsk2 vector before
+    computing anything Montauk-specific.
+    """
+    _validate_against_cacophony()
+    ts8 = TIMESTAMP.to_bytes(8, "big")
+    out = {}
+    for key, section, nonce, p1 in [
+        ("handshake_direct", "13.6", NONCE_DIRECT, b""),
+        ("handshake_brokered", "13.7", NONCE_BROKERED, service_id),
+    ]:
+        prologue = b"\x01" + ts8 + nonce
+        m1, m2, hh, (i_send, i_recv, r_send, r_recv) = run_handshake(
+            prologue, alice_priv, init_eph, bob_priv, resp_eph, psk, p1, b""
+        )
+        entry = {
+            "section": section,
+            "inputs": {
+                "init_static": alice_priv.hex(),
+                "resp_static": bob_priv.hex(),
+                "init_ephemeral": init_eph.hex(),
+                "resp_ephemeral": resp_eph.hex(),
+                "resp_ephemeral_pub": pubkey(resp_eph).hex(),
+                "psk": psk.hex(),
+                "prologue": prologue.hex(),
+                "msg1_payload": p1.hex(),
+                "msg2_payload": "",
+            },
+            "outputs": {
+                "message_1": m1.hex(),
+                "message_2": m2.hex(),
+                "handshake_hash": hh.hex(),
+            },
+        }
+        if key == "handshake_direct":
+            t1 = i_send.encrypt(b"", b"ping")
+            t2 = r_send.encrypt(b"", b"pong")
+            entry["outputs"]["transport_1"] = {"plaintext": b"ping".hex(), "ciphertext": t1.hex()}
+            entry["outputs"]["transport_2"] = {"plaintext": b"pong".hex(), "ciphertext": t2.hex()}
+            frame_body = b"\x01" + ts8 + NONCE_DIRECT + m1
+            out["first_packet"] = {
+                "section": "13.5",
+                "inputs": {
+                    "version": 1,
+                    "timestamp": TIMESTAMP,
+                    "nonce": NONCE_DIRECT.hex(),
+                    "payload": m1.hex(),
+                },
+                "outputs": {
+                    "frame_body": frame_body.hex(),
+                    "wire_format": (len(frame_body).to_bytes(2, "big") + frame_body).hex(),
+                    "noise_prologue": frame_body[:25].hex(),
+                },
+            }
+        out[key] = entry
+    return out
+
+
+def main():
+    v = vectors()
+    print("Noise stack validated against the official cacophony IKpsk2 vector (byte-for-byte)")
+    print("resp_ephemeral_pub =", v["handshake_direct"]["inputs"]["resp_ephemeral_pub"])
+    for key, label in [("handshake_direct", "DIRECT"), ("handshake_brokered", "BROKERED")]:
+        e = v[key]
+        m1 = bytes.fromhex(e["outputs"]["message_1"])
+        m2 = bytes.fromhex(e["outputs"]["message_2"])
+        print(f"\n[{e['section']}] {label}")
+        print("  prologue =", e["inputs"]["prologue"])
+        print(f"  noise_message_1 ({len(m1)} bytes) =")
+        print("         ", grouped(m1))
+        print(f"  noise_message_2 ({len(m2)} bytes) =")
+        print("         ", grouped(m2))
+        print("  handshake_hash =")
+        print("         ", grouped(bytes.fromhex(e["outputs"]["handshake_hash"])))
+        print(f"  first_packet frame body = {25 + len(m1)} bytes (0x{25 + len(m1):04x}), msg2 frame = 0x{len(m2):04x}")
+        if key == "handshake_direct":
+            t1 = bytes.fromhex(e["outputs"]["transport_1"]["ciphertext"])
+            t2 = bytes.fromhex(e["outputs"]["transport_2"]["ciphertext"])
+            print(f'  transport_1 init->resp "ping" ({len(t1)} bytes) =')
+            print("         ", grouped(t1))
+            print(f'  transport_2 resp->init "pong" ({len(t2)} bytes) =')
+            print("         ", grouped(t2))
+
+
+if __name__ == "__main__":
+    main()

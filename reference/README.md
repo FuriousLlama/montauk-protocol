@@ -8,6 +8,8 @@ and verification tooling, not the sample implementation.
 | ---- | --------- | ------------ |
 | `vectors_address.py` | §13.1–13.4 (keys, shared secret, session key, addresses) | Python 3.10+, stdlib only |
 | `vectors_handshake.py` | §13.5–13.7 (First Packet, handshake transcripts) | `pip install cryptography` |
+| `export_vectors.py` | `vectors.json` — machine-readable export of every vector | `pip install cryptography` |
+| `vectors.json` | — (generated output; consumed by `impl/tests` and other implementations) | — |
 | `cacophony_ikpsk2.json` | — (ground-truth data) | vendored from the [cacophony](https://github.com/haskell-cryptography/cacophony) project |
 
 ## Running
@@ -15,6 +17,7 @@ and verification tooling, not the sample implementation.
 ```
 python3 vectors_address.py
 pip install cryptography && python3 vectors_handshake.py
+python3 export_vectors.py   # refreshes vectors.json
 ```
 
 ## Validation chain
@@ -35,4 +38,13 @@ ground truth at runtime:
 
 Every value these scripts print appears verbatim in the spec. After any
 change to address derivation (§6) or the handshake (§4.4, §7), rerun both
-scripts and update §13 to match.
+scripts, update §13 to match, and rerun `export_vectors.py` so
+`vectors.json` (and therefore the implementation's golden tests) stays in
+lockstep.
+
+## License
+
+Generator code is Apache-2.0 (see the repository [LICENSE](../LICENSE)).
+Generated vectors are dedicated to the public domain under CC0 1.0. The
+vendored `cacophony_ikpsk2.json` comes from the public-domain
+[cacophony](https://github.com/haskell-cryptography/cacophony) project.
