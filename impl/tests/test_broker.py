@@ -116,3 +116,24 @@ async def _unknown_target_scenario():
 
 def test_broker_unknown_target_not_found():
     assert asyncio.run(asyncio.wait_for(_unknown_target_scenario(), 20)) == "not_found"
+
+
+async def _keepalive_echo_scenario():
+    bpriv, bpub, psk = _broker_material()
+    bkr = broker.MontaukBroker("127.0.0.1", 0, bpriv, psk)
+    bhost, bport = await bkr.start()
+    client_priv = crypto.generate_private_key()
+    reader, writer, send_cs, recv_cs = await broker._open_link(bhost, bport, client_priv, bpub, psk)
+    try:
+        await transport.write_encrypted(writer, send_cs, broker.encode_register(crypto.public_key(client_priv), []))
+        assert (await transport.read_encrypted(reader, recv_cs))[0] == broker.REGISTERED
+        await transport.write_encrypted(writer, send_cs, b"")  # §7.5.4 keepalive
+        return await asyncio.wait_for(transport.read_encrypted(reader, recv_cs), 5)
+    finally:
+        writer.close()
+        await bkr.close()
+
+
+def test_broker_echoes_keepalive():
+    """§7.5.4: the broker MUST answer each client keepalive with one keepalive."""
+    assert asyncio.run(asyncio.wait_for(_keepalive_echo_scenario(), 15)) == b""

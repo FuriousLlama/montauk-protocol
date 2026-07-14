@@ -114,11 +114,14 @@ def validate_first_packet(
     *,
     now: int,
     nonce_cache: NonceCache,
-    tolerance: int = TIMESTAMP_TOLERANCE,
     version: int = VERSION,
 ):
     """§11.3-§11.5 in check order: version, timestamp window, nonce replay.
-    Any PacketInvalid raised here maps to a silent drop — no response, ever."""
+    The timestamp tolerance is the nonce cache's own tolerance, so the cache's
+    retention horizon always covers the acceptance window (a wider validation
+    tolerance can never outrun the cache and admit a replay). Any PacketInvalid
+    raised here maps to a silent drop — no response, ever."""
+    tolerance = nonce_cache.tolerance
     if fp.version != version:
         raise PacketInvalid("bad_version")
     if not (now - tolerance <= fp.timestamp <= now + tolerance):

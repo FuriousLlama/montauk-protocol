@@ -74,10 +74,10 @@ def test_11_3_timestamp_window_inclusive(skew, ok):
     cache = wire.NonceCache(tolerance=30)
     fp = make_fp(timestamp=now + skew)
     if ok:
-        wire.validate_first_packet(fp, now=now, nonce_cache=cache, tolerance=30)
+        wire.validate_first_packet(fp, now=now, nonce_cache=cache)
     else:
         with pytest.raises(PacketInvalid) as exc:
-            wire.validate_first_packet(fp, now=now, nonce_cache=cache, tolerance=30)
+            wire.validate_first_packet(fp, now=now, nonce_cache=cache)
         assert exc.value.reason == "timestamp_out_of_window"
 
 

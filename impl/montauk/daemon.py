@@ -16,6 +16,7 @@ import socket
 
 from . import transport
 from .core import engine, wire
+from .core.constants import HANDSHAKE_TIMEOUT
 from .core.model import Identity, ValidSetEntry
 from .firewall import Firewall, NullFirewall
 
@@ -152,13 +153,16 @@ class MontaukDaemon:
         target_writer = None
         try:
             relationship = self.relationships[entry.relationship_id]
-            send_cs, recv_cs, service_id = await transport.do_responder_handshake(
-                reader, writer,
-                identity=self.identity,
-                relationship=relationship,
-                entry=entry,
-                nonce_cache=self._nonce_cache,
-                now=self.clock(),
+            send_cs, recv_cs, service_id = await asyncio.wait_for(
+                transport.do_responder_handshake(
+                    reader, writer,
+                    identity=self.identity,
+                    relationship=relationship,
+                    entry=entry,
+                    nonce_cache=self._nonce_cache,
+                    now=self.clock(),
+                ),
+                HANDSHAKE_TIMEOUT,  # §11.6: a peer that stalls must not pin the handler
             )
             service = relationship.service(service_id)
             host, port = split_hostport(service.internal_target)

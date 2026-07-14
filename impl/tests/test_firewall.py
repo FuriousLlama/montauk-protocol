@@ -42,26 +42,32 @@ def test_start_builds_default_drop_ruleset():
     asyncio.run(NftablesFirewall(PREFIX, run=rec).start())
     flat = rec.flat
     assert "add set ip6 montauk valid { type ipv6_addr . inet_service; flags timeout; }" in flat
-    # valid tuples accepted, everything else to the prefix dropped (silent)
+    # established connections keep their path; new connections to valid tuples
+    # are accepted; everything else to the prefix is dropped (silent).
+    assert "ct state established,related accept" in flat
     assert "ip6 daddr . tcp dport @valid accept" in flat
     assert "ip6 daddr 2001:db8:1234:5678::/64 drop" in flat
-    # accept rule must precede the drop rule
-    assert flat.index("@valid accept") < flat.index("drop")
+    # ordering: established accept, then valid accept, then drop
+    assert flat.index("established,related accept") < flat.index("@valid accept") < flat.index("drop")
 
 
-def test_allow_adds_element_with_remaining_validity_as_timeout():
+def test_allow_timeout_spans_the_full_window():
     rec = Recorder()
+    # valid_until is the bucket end; the element must live one bucket longer (the
+    # window end) so the listener's whole lifetime is covered. now=700 ->
+    # 1000 + 300 - 700 = 600s.
     e = entry("2001:db8:1234:5678::abcd", 40000, valid_until=1000)
     asyncio.run(NftablesFirewall(PREFIX, run=rec).allow([e], now=700))
     assert rec.batches == [
-        ["add element ip6 montauk valid { 2001:db8:1234:5678::abcd . 40000 timeout 300s }"]
+        ["add element ip6 montauk valid { 2001:db8:1234:5678::abcd . 40000 timeout 600s }"]
     ]
 
 
 def test_allow_clamps_timeout_to_at_least_one_second():
     rec = Recorder()
     e = entry("2001:db8:1234:5678::1", 1024, valid_until=500)
-    asyncio.run(NftablesFirewall(PREFIX, run=rec).allow([e], now=500))  # already at expiry
+    # now past the window end (500 + 300): 500 + 300 - 900 = -100 -> clamped to 1s.
+    asyncio.run(NftablesFirewall(PREFIX, run=rec).allow([e], now=900))
     assert "timeout 1s" in rec.flat
 
 

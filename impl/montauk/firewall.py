@@ -13,6 +13,7 @@ tests and hosts without nftables) and NftablesFirewall (real enforcement).
 import asyncio
 from typing import Iterable, Protocol
 
+from .core.constants import BUCKET_DURATION
 from .core.errors import MontaukError
 from .core.model import IPv6Prefix, ValidSetEntry
 
@@ -91,7 +92,12 @@ class NftablesFirewall:
                 f"add table ip6 {self.table}",
                 f"add set ip6 {self.table} valid {{ type ipv6_addr . inet_service; flags timeout; }}",
                 f"add chain ip6 {self.table} input {{ type filter hook input priority 0; policy accept; }}",
+                # An established connection keeps its inbound path even after its
+                # tuple leaves the valid set (§8.4: in-flight connections continue).
+                f"add rule ip6 {self.table} input ct state established,related accept",
+                # A new connection to a currently-valid tuple is accepted.
                 f"add rule ip6 {self.table} input ip6 daddr . tcp dport @valid accept",
+                # Anything else to the prefix is dropped silently (§11.5).
                 f"add rule ip6 {self.table} input ip6 daddr {self.prefix} drop",
             ]
         )
@@ -99,7 +105,11 @@ class NftablesFirewall:
     async def allow(self, entries: Iterable[ValidSetEntry], now: int) -> None:
         cmds = []
         for e in entries:
-            timeout = max(1, e.valid_until - now)
+            # The element must live as long as its listener, i.e. until the tuple
+            # leaves the ±1-bucket window (one bucket past its own validity), so
+            # the trailing half of the window is not dropped early. The timeout is
+            # a crash fail-safe; rotation removes the element explicitly.
+            timeout = max(1, e.valid_until + BUCKET_DURATION - now)
             cmds.append(f"add element ip6 {self.table} valid {{ {self._elem(e)} timeout {timeout}s }}")
         if cmds:
             await self._run(cmds)

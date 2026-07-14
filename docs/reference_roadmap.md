@@ -254,3 +254,25 @@ iptables -I FORWARD -s 10.77.0.0/24 -j ACCEPT   # + -d ...  (Docker sets FORWARD
 
 **Next**: write `docs/deployment.md` from this, and use the third-node
 pattern (add a NAT router VM) for the M5 broker.
+
+## 11. Independent Review (2026-07-09)
+
+An adversarial read-only review (separate agent) of spec v0.4.0-draft vs.
+`impl/montauk/`. It confirmed the cryptographic core correct (Noise IKpsk2,
+X25519/HKDF/HMAC, address derivation, prologue binding, vectors) and found
+bugs concentrated in the I/O shell. All fixed except L8:
+
+| # | Finding | Fix | Status |
+| - | ------- | --- | ------ |
+| H1 | nftables had no `ct state established,related accept`; a live connection's tuple element expired at the bucket boundary and its inbound path was dropped | Added the established-accept rule (`firewall.py`) | Fixed; validated cross-host (established connection survives element deletion, new connection still dropped) |
+| M2 | firewall element timeout tracked the bucket end, not the window end, dropping the trailing half of the ±1-bucket window | `timeout = valid_until + BUCKET_DURATION - now` | Fixed + unit test |
+| M3 | no responder-side handshake timeout (§11.6 slowloris) | `asyncio.wait_for(handshake, HANDSHAKE_TIMEOUT=5)` in daemon and brokered responder | Fixed |
+| M4 | broker keepalive echo (§7.5.4 MUST) and §9.4 limits unimplemented | keepalive echo + client keepalive sender + dead-client reaper + `MAX_PENDING_MATCHES` | Fixed + keepalive test |
+| L5 | broker match/accept race could leave a dial-back awaiting forever | settle `pending.finished` in a `finally` covering the timeout path | Fixed |
+| L6 | nonce-cache retention horizon decoupled from validation tolerance | `validate_first_packet` uses `nonce_cache.tolerance` (single source) | Fixed |
+| L7 | TCP FIN close is unauthenticated; broker/on-path can truncate undetectably | Spec caveat added (§8.2, §9.5) | Documented |
+| — | §6.4 overstated skew tolerance as ±5 min (really ≈±30 s, the timestamp∩address intersection) | Spec corrected (§6.4) | Documented |
+| L8 | broker rendezvous is a fixed host:port, not §9.2's computed rotating addresses | — | Open (larger feature; the Noise-auth half was already done in v0.4) |
+
+Verdicts: implementation faithful on the crypto/wire core, now faithful on the
+firewall/valid-set enforcement and broker keepalives too; protocol design sound.

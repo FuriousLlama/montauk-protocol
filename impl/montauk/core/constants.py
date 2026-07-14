@@ -16,3 +16,4 @@ BROKER_PROLOGUE = b"montauk-broker-v1"  # prologue for the client<->broker link 
 FIRST_PACKET_HEADER_LEN = 25  # version(1) + timestamp(8) + nonce(16), §7.2
 MAX_FRAME_BODY = 65535  # UINT16 frame length, §7.1
 TIMESTAMP_TOLERANCE = 30  # seconds, RECOMMENDED default, §11.3
+HANDSHAKE_TIMEOUT = 5  # seconds to complete a handshake before dropping, §11.6

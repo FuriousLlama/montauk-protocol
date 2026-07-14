@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from . import transport
 from .core import wire
+from .core.constants import HANDSHAKE_TIMEOUT
 from .daemon import split_hostport
 
 log = logging.getLogger("montauk.broker")
@@ -38,7 +39,10 @@ ERROR_UNAUTHORIZED = 0x20
 ERROR_NOT_FOUND = 0x21
 ERROR_TIMEOUT = 0x22
 
-DIAL_BACK_TIMEOUT = 10  # seconds, §9.4
+DIAL_BACK_TIMEOUT = 10  # MATCH_OFFER validity window (§9.4)
+KEEPALIVE_INTERVAL = 25  # client sends a keepalive this often (§9.4)
+CLIENT_DEAD_AFTER = 75  # no keepalive within this -> reap the registration (§9.4)
+MAX_PENDING_MATCHES = 4  # outstanding MATCH_OFFERs per client (§9.4)
 
 
 # --- control message bodies (sent encrypted over the broker link) ---
@@ -64,10 +68,11 @@ class _Control:
     writer: asyncio.StreamWriter
     send_cs: object
     authorized: set[bytes]
+    pending: int = 0  # outstanding MATCH_OFFERs (§9.4 MAX_PENDING_MATCHES)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def push(self, body: bytes) -> None:
-        async with self.lock:  # serialize cipher-state use across concurrent offers
+        async with self.lock:  # serialize cipher-state use across concurrent offers/keepalives
             await transport.write_encrypted(self.writer, self.send_cs, body)
 
 
@@ -142,9 +147,16 @@ class MontaukBroker:
         await control.push(encode_response(REGISTERED))
         log.info("registered %s (%d authorized)", party.hex()[:8], len(authorized))
         try:
-            while True:  # keep control channel open; drain encrypted keepalives
-                if await transport.read_encrypted(reader, recv_cs) is None:
+            while True:  # keep the control channel open, echo keepalives, reap dead clients
+                try:
+                    frame = await asyncio.wait_for(transport.read_encrypted(reader, recv_cs), CLIENT_DEAD_AFTER)
+                except asyncio.TimeoutError:
+                    log.info("client %s reaped (no keepalive)", party.hex()[:8])
                     break
+                if frame is None:
+                    break
+                if frame == b"":  # §7.5.4: answer each keepalive with one keepalive
+                    await control.push(b"")
         finally:
             if self._clients.get(party) is control:
                 del self._clients[party]
@@ -161,29 +173,34 @@ class MontaukBroker:
             await transport.write_encrypted(writer, send_cs, encode_response(ERROR_UNAUTHORIZED))
             writer.close()
             return
-        match_id = os.urandom(16)
-        pending = _Pending(target, reader, writer)
-        self._pending[match_id] = pending
-        await chan.push(encode_response(MATCH_OFFER, match_id))
-        await transport.write_encrypted(writer, send_cs, encode_response(WAITING))
-        try:
-            data_reader, data_writer, data_send_cs = await asyncio.wait_for(pending.data, DIAL_BACK_TIMEOUT)
-        except asyncio.TimeoutError:
-            self._pending.pop(match_id, None)
+        if chan.pending >= MAX_PENDING_MATCHES:  # §9.4 per-client cap
             await transport.write_encrypted(writer, send_cs, encode_response(ERROR_TIMEOUT))
             writer.close()
             return
-        # Both ends present: send MATCHED (last encrypted frame each way), then
-        # relay raw end-to-end bytes.
-        await transport.write_encrypted(writer, send_cs, encode_response(MATCHED))
-        await transport.write_encrypted(data_writer, data_send_cs, encode_response(MATCHED))
-        log.info("bridging match %s (target %s)", match_id.hex()[:8], target.hex()[:8])
+        match_id = os.urandom(16)
+        pending = _Pending(target, reader, writer)
+        self._pending[match_id] = pending
+        chan.pending += 1
         try:
+            await chan.push(encode_response(MATCH_OFFER, match_id))
+            await transport.write_encrypted(writer, send_cs, encode_response(WAITING))
+            data_reader, data_writer, data_send_cs = await asyncio.wait_for(pending.data, DIAL_BACK_TIMEOUT)
+            # Both ends present: MATCHED each way (last encrypted frame), then relay raw bytes.
+            await transport.write_encrypted(writer, send_cs, encode_response(MATCHED))
+            await transport.write_encrypted(data_writer, data_send_cs, encode_response(MATCHED))
+            log.info("bridging match %s (target %s)", match_id.hex()[:8], target.hex()[:8])
             await _bridge(reader, writer, data_reader, data_writer)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(Exception):
+                await transport.write_encrypted(writer, send_cs, encode_response(ERROR_TIMEOUT))
         finally:
+            # Always settle `finished` so a dial-back that raced past the timeout
+            # is not left awaiting forever (L5).
             self._pending.pop(match_id, None)
+            chan.pending = max(0, chan.pending - 1)
             if not pending.finished.done():
                 pending.finished.set_result(True)
+            writer.close()
 
     async def _handle_accept(self, body, party, reader, writer, send_cs):
         match_id = body[1:17]
@@ -193,7 +210,10 @@ class MontaukBroker:
             writer.close()
             return
         pending.data.set_result((reader, writer, send_cs))
-        await pending.finished  # hold the data connection open until the bridge ends
+        try:
+            await pending.finished  # hold the data connection open until the bridge ends
+        finally:
+            writer.close()
 
 
 async def _bridge(r1, w1, r2, w2):
@@ -227,23 +247,33 @@ async def _open_link(broker_host, broker_port, static_private, broker_pubkey, li
     return reader, writer, send_cs, recv_cs
 
 
+async def _keepalive_loop(writer, send_cs):
+    while True:
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
+        await transport.write_encrypted(writer, send_cs, b"")  # §7.5.4 keepalive
+
+
 async def register(broker_host, broker_port, static_private, broker_pubkey, link_psk, client_pubkey, authorizations, on_offer):
     """Register as a client and dispatch each MATCH_OFFER to on_offer(match_id).
-    Blocks holding the control connection until it drops."""
+    Sends keepalives and blocks holding the control connection until it drops."""
     reader, writer, send_cs, recv_cs = await _open_link(broker_host, broker_port, static_private, broker_pubkey, link_psk)
     await transport.write_encrypted(writer, send_cs, encode_register(client_pubkey, list(authorizations)))
     resp = await transport.read_encrypted(reader, recv_cs)
     if not resp or resp[0] != REGISTERED:
         writer.close()
         raise RuntimeError("broker did not register us")
+    keepalive = asyncio.create_task(_keepalive_loop(writer, send_cs))
     try:
         while True:
             frame = await transport.read_encrypted(reader, recv_cs)
             if frame is None:
                 break
-            if frame[0] == MATCH_OFFER:
+            if frame and frame[0] == MATCH_OFFER:  # an empty frame is a keepalive echo; ignore
                 await on_offer(frame[1:17])
     finally:
+        keepalive.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await keepalive
         writer.close()
 
 
@@ -292,8 +322,11 @@ async def _serve_offer(broker_host, broker_port, match_id, identity, relationshi
     )
     target_writer = None
     try:
-        send_cs, recv_cs, service_id = await transport.do_responder_handshake(
-            reader, writer, identity=identity, relationship=relationship, nonce_cache=nonce_cache, brokered=True
+        send_cs, recv_cs, service_id = await asyncio.wait_for(
+            transport.do_responder_handshake(
+                reader, writer, identity=identity, relationship=relationship, nonce_cache=nonce_cache, brokered=True
+            ),
+            HANDSHAKE_TIMEOUT,  # §11.6
         )
         service = relationship.service(service_id)
         host, port = split_hostport(service.internal_target)

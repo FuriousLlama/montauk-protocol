@@ -412,7 +412,12 @@ valid_addresses = [
 ]
 ```
 
-This provides tolerance of ±BUCKET_DURATION seconds (±5 minutes with default settings).
+This provides *address* tolerance of ±BUCKET_DURATION seconds. The **effective**
+clock-skew tolerance for a connection is smaller: it is the intersection of this
+address window and the FirstPacket timestamp window (§11.3), which defaults to
+±30 seconds. So with default settings a connection tolerates roughly ±30 s of
+skew, not ±5 minutes — the wide address window mainly ensures a listener is
+already bound before its bucket becomes current.
 
 ### 6.5 Directionality
 
@@ -624,7 +629,11 @@ Initiator                                         Responder
 3. **Connection close**: End-of-stream is signaled with a TCP FIN, carried
    through the encrypted channel in each direction independently (half-close is
    permitted). Closing one direction MUST NOT force the other closed until it
-   also reaches end-of-stream.
+   also reaches end-of-stream. Note this FIN is *not* cryptographically
+   authenticated: an on-path attacker (or, for brokered connections, the broker)
+   can truncate the stream, which the transport does not detect. Applications
+   that require truncation detection MUST carry their own authenticated
+   end-of-message marker.
 
 ### 8.3 Brokered Connection
 
@@ -809,6 +818,7 @@ Bridges have no idle timeout of their own: bridged traffic is opaque to the brok
 | Traffic analysis        | Broker can observe timing and volume                |
 | Impersonation           | Broker cannot impersonate clients (no private keys) |
 | Handshake replay        | Broker cannot replay end-to-end handshakes (header is prologue-bound; timestamps expire) |
+| Stream truncation       | Broker CAN truncate the relayed stream undetectably (TCP FIN is unauthenticated, §8.2) |
 
 ### 9.6 Broker Redundancy
 
@@ -1364,6 +1374,8 @@ clarifications and added requirements; no wire formats or test vectors change.
 - §6.3, §12.1: binding a computed address requires a non-local-bind facility (`IPV6_FREEBIND`) in addition to the routing prefix; made this a mandatory capability
 - §12.4 (new): implementations MUST NOT silently double-book a colliding tuple, and SHOULD remove firewall state on graceful shutdown (crash safety already rests on valid-set timeouts)
 - §9.3: clarified that broker authorization MUST use the identities parties authenticated with in their Noise handshake to the broker, not values asserted in messages
+- §6.4: corrected the tolerance claim — the effective clock-skew tolerance is the intersection of the address window and the ±30s timestamp window (≈±30s), not ±5 minutes (from independent review)
+- §8.2, §9.5: noted that the TCP FIN carrying end-of-stream is not authenticated, so an on-path attacker or the broker can truncate the stream undetectably (from independent review)
 
 ### Version 0.3.0-draft (July 2026)
 
