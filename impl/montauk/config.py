@@ -96,7 +96,7 @@ def _relationship_from_json(d: dict) -> Relationship:
     )
 
 
-def save_card(path: str, identity: Identity, relationships) -> None:
+def save_card(path: str, identity: Identity, relationships, broker: dict | None = None) -> None:
     doc = {
         "identity": {
             "private": _h(identity.static_private),
@@ -105,6 +105,8 @@ def save_card(path: str, identity: Identity, relationships) -> None:
         },
         "relationships": [_relationship_to_json(r) for r in relationships],
     }
+    if broker is not None:  # this party reaches/serves via a broker
+        doc["broker"] = broker
     # A card holds the private key, prior, and handshake_password in the clear;
     # create it 0600 (before writing) so a local co-tenant cannot read them.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -128,3 +130,47 @@ def find_service(relationships, name: str) -> tuple[Relationship, ServiceDefinit
             if svc.name == name:
                 return rel, svc
     raise KeyError(f"no service named {name!r} in card")
+
+
+# --- broker cards / endpoints ---
+
+def load_broker(path: str) -> dict | None:
+    """The optional 'broker' section of a party card (public broker info)."""
+    with open(path) as f:
+        return json.load(f).get("broker")
+
+
+def broker_endpoint(broker: dict, connect_host: str | None = None):
+    """Build a BrokerEndpoint from a card's broker section."""
+    from .broker import BrokerEndpoint
+
+    return BrokerEndpoint(
+        broker_pubkey=bytes.fromhex(broker["pubkey"]),
+        link_psk=bytes.fromhex(broker["link_psk"]),
+        host=broker.get("host"),
+        port=broker.get("port"),
+        prefix=_prefix_from_str(broker.get("prefix")),
+        guest_prior=bytes.fromhex(broker["guest_prior"]) if broker.get("guest_prior") else None,
+        connect_host=connect_host,
+    )
+
+
+def save_broker_card(path, private, link_psk, *, host=None, port=None, prefix=None) -> None:
+    """A broker's own card: its private key, link PSK, and listen endpoint."""
+    doc = {
+        "broker_private": _h(private),
+        "broker_public": _h(crypto.public_key(private)),
+        "link_psk": _h(link_psk),
+        "host": host,
+        "port": port,
+        "prefix": prefix,  # already a string
+    }
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(doc, f, indent=2)
+
+
+def load_broker_card(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)

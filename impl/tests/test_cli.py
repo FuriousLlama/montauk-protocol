@@ -2,13 +2,23 @@
 """CLI: card round-trip and a pair -> serve -> connect e2e over loopback."""
 
 import asyncio
+import socket
 import stat
 
 from conftest import ORIGIN_BODY, http_get, start_origin
 
+from montauk import broker as broker_mod
 from montauk import cli, config
 from montauk.client import LocalForward
 from montauk.daemon import MontaukDaemon
+
+
+def _free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 def test_keygen(capsys):
@@ -74,3 +84,44 @@ def test_pair_then_direct_connection(tmp_path):
     body = asyncio.run(asyncio.wait_for(_pair_serve_connect(tmp_path), 15))
     assert b"200 OK" in body
     assert ORIGIN_BODY in body
+
+
+async def _cli_brokered_scenario(tmp_path) -> bytes:
+    origin_server, origin_target = await start_origin()
+    port = _free_port()
+    bob, alice, brk = tmp_path / "bob.json", tmp_path / "alice.json", tmp_path / "broker.json"
+    cli.main([
+        "pair", "--responder-prefix", "2001:db8:1234:5678::/64", "--service", f"web={origin_target}",
+        "--out-responder", str(bob), "--out-initiator", str(alice),
+        "--broker-host", f"127.0.0.1:{port}", "--out-broker", str(brk),
+    ])
+    # Drive the card-derived brokered flow (what `montauk broker/serve/connect` do).
+    bc = config.load_broker_card(str(brk))
+    bkr = broker_mod.MontaukBroker("127.0.0.1", port, bytes.fromhex(bc["broker_private"]), bytes.fromhex(bc["link_psk"]))
+    await bkr.start()
+    resp_id, resp_rels = config.load_card(str(bob))
+    responder = asyncio.create_task(
+        broker_mod.serve_brokered_responder(config.broker_endpoint(config.load_broker(str(bob))), resp_id, resp_rels[0])
+    )
+    await asyncio.sleep(0.3)
+    init_id, init_rels = config.load_card(str(alice))
+    rel, svc = config.find_service(init_rels, "web")
+    server, fh, fp = await broker_mod.brokered_forward(
+        config.broker_endpoint(config.load_broker(str(alice))), init_id, rel, svc.service_id, "127.0.0.1", 0
+    )
+    try:
+        return await http_get(fh, fp)
+    finally:
+        server.close()
+        await server.wait_closed()
+        responder.cancel()
+        await asyncio.gather(responder, return_exceptions=True)
+        await bkr.close()
+        origin_server.close()
+        await origin_server.wait_closed()
+
+
+def test_pair_broker_then_brokered_connection(tmp_path):
+    """`montauk pair --broker-host` cards drive a full brokered connection."""
+    body = asyncio.run(asyncio.wait_for(_cli_brokered_scenario(tmp_path), 20))
+    assert b"200 OK" in body and ORIGIN_BODY in body

@@ -469,3 +469,29 @@ async def connect_brokered(endpoint, identity, relationship, service_id):
         reader, writer, identity=identity, relationship=relationship, service_id=service_id, brokered=True
     )
     return send_cs, recv_cs, reader, writer
+
+
+async def brokered_forward(endpoint, identity, relationship, service_id, local_host, local_port):
+    """Local port-forward over a broker (the brokered analogue of
+    client.LocalForward): each local connection opens a fresh brokered
+    connection and proxies. Returns (server, bound_host, bound_port)."""
+
+    async def on_local(local_reader, local_writer):
+        channel_writer = None
+        try:
+            send_cs, recv_cs, channel_reader, channel_writer = await connect_brokered(
+                endpoint, identity, relationship, service_id
+            )
+        except Exception as exc:
+            log.debug("brokered forward failed: %s", exc)
+            local_writer.close()
+            return
+        try:
+            await transport.proxy(channel_reader, channel_writer, send_cs, recv_cs, local_reader, local_writer)
+        finally:
+            channel_writer.close()
+            local_writer.close()
+
+    server = await asyncio.start_server(on_local, local_host, local_port)
+    host, port = server.sockets[0].getsockname()[:2]
+    return server, host, port

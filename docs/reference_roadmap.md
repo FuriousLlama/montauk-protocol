@@ -209,13 +209,12 @@ version that resolved it.
 - [x] Direct connection driven by the `montauk` CLI (`pair`/`serve`/`connect`)
       cross-host on the testbed: HTTP 200 through the forward, real computed
       addresses, nft firewall, graceful cleanup
-- [~] Every MUST in §12.1 has a passing, section-named test — most are covered
-      (golden vectors, prologue, payload rules, framing, timestamp/nonce,
-      window); a line-by-line §12.1 audit is still worth doing
-- [ ] Remaining: brokered reachability wired into the `serve`/`connect` card
-      flow (the broker itself and the brokered client/initiator glue exist and
-      are validated via `harness/m5_node.py`); a `montauk.cli` `--user`-mode
-      SIGTERM audit on non-systemd hosts
+- [x] Every MUST in §12.1 has a passing test — audited line by line (§12 below);
+      the one gap (peer-static binding) now has `test_responder_rejects_wrong_peer_identity`
+- [x] Brokered reachability wired into the `serve`/`connect` card flow —
+      `montauk pair --broker-host` mints brokered cards + a broker card;
+      `serve`/`connect` detect the card's broker section and register/forward
+      through it (`test_pair_broker_then_brokered_connection`)
 
 ## 10. Proxmox Testbed (M4/M5)
 
@@ -298,5 +297,38 @@ per-bucket rotation, mirroring the daemon), and clients compute the same address
 to reach it. §9.2 was corrected to a shared-guest rendezvous keyed from the
 semi-public `guest_prior` (the original per-party ECDH address is impractical —
 the broker can't pre-bind an address for an initiator whose key it doesn't yet
-know). Validated on loopback; the real-address path reuses the M4-proven
-AnyIP + freebind mechanism. The whole review-and-fix loop is now closed.
+know). Validated on loopback **and cross-host on the testbed** (broker binds 3
+rotating rendezvous addresses in a broker prefix via AnyIP+freebind; the
+initiator on the second host computes the same address and connects through it;
+M5 PASS). The whole review-and-fix loop is now closed.
+
+**"Finish the reference" (after the review loop):** brokered mode wired into the
+CLI card flow (`montauk pair --broker-host` → brokered cards + broker card;
+`serve`/`connect` register/forward through the broker — `config.broker_endpoint`,
+`broker.brokered_forward`); the §12.1 conformance audit (§12 below) with the
+peer-static-binding gap closed; and the L8 rendezvous validated cross-host.
+
+## 12. §12.1 Conformance Audit
+
+Each MUST in spec §12.1 (and the §12.3 interop MUSTs), mapped to a test:
+
+| §12.1 MUST | Test(s) |
+| ---------- | ------- |
+| X25519 key generation and agreement | `test_13_1_key_generation`, `test_13_2_shared_secret_both_directions` |
+| HKDF-SHA256 key derivation | `test_13_3_session_key` |
+| HMAC-SHA256 address generation | `test_13_4_address_generation` (+ property test in `test_engine`) |
+| Noise_IKpsk2_25519_ChaChaPoly_SHA256 handshake | `test_13_6/13_7_handshake_*`, `test_noise.py` (validated vs. cacophony vector) |
+| Noise prologue bound to the First Packet header | `test_4_4_prologue_binding_rejects_restamped_header` |
+| Handshake payload length validation | `test_4_4_payload_rules` |
+| Length-prefixed message framing | `test_7_1_*` (roundtrip, oversized, chunking-invariant) |
+| Timestamp validation with configurable tolerance | `test_11_3_timestamp_window_inclusive`, `test_timestamp_skew_tolerance` |
+| Nonce tracking and replay rejection | `test_11_4_nonce_replay_rejected`, `test_11_4_nonce_cache_expires_entries` |
+| Address window computation (current ±1 bucket) | `test_6_4_window_is_three_contiguous_buckets`, `test_connection_succeeds_across_boundary` |
+| Bind computed addresses without per-address provisioning (FREEBIND) | Behaviorally validated cross-host in M4 and the H1 firewall test; no pure unit test (needs AnyIP/root) |
+| Verify handshake-authenticated peer static key vs. relationship | `test_responder_rejects_wrong_peer_identity` |
+
+§12.3 interop MUSTs (big-endian integers, exact constant strings, exact wire
+formats, pass all §13 vectors) are covered by `test_golden_vectors.py` +
+`test_wire.py`. The one item without a unit test — FREEBIND binding — is
+inherently integration-level (it needs a routed prefix + CAP_NET_ADMIN) and is
+covered by the M4/H1 testbed runs (§10).
