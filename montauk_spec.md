@@ -296,7 +296,7 @@ Reachability := {
 | 0x01       | DIRECT - Participant has globally routable IPv6 | prefix                                           |
 | 0x02       | BROKERED - Participant uses a broker            | broker_pubkey, broker_prefix, broker_guest_prior |
 
-The routing prefix constrains address generation (Section 6.3): generated addresses must fall within a prefix that actually routes to the responder.
+The routing prefix constrains address generation (Section 6.3): generated addresses must fall within a prefix that actually routes to the responder. Any prefix length is permitted; the length sets the size of the unauthorized search space, with the tradeoff detailed in Section 11.8.
 
 ### 5.5 Service Definition
 
@@ -393,7 +393,7 @@ Where:
 - `AND`, `OR`, `NOT` are bitwise operations over 128 bits
 - `raw[0:16]` is the first 16 bytes; `raw[16]` and `raw[17]` are individual bytes
 
-The responder MUST ensure the advertised prefix actually routes to it (typically by advertising the /64 of the network segment the Montauk Server occupies). A shorter prefix leaves more derived bits and therefore a larger unauthorized search space (Section 11.2).
+The responder MUST ensure the advertised prefix actually routes to it (typically by advertising the /64 of the network segment the Montauk Server occupies). Any prefix length P (0–128) is permitted: a shorter prefix leaves more derived host bits and therefore a larger unauthorized search space, while a longer prefix still functions correctly with a smaller space. Section 11.8 gives the full size/concealment tradeoff.
 
 On common IPv6 stacks, making the prefix locally deliverable (e.g. a Linux AnyIP `local` route) is *necessary but not sufficient* to bind an individual computed address: the listening socket must additionally opt in to binding a non-assigned address (`IPV6_FREEBIND`, or the equivalent non-local-bind facility). The route enables delivery; the socket option enables the bind. Implementations MUST bind computed addresses without requiring each to be provisioned as an interface address.
 
@@ -949,7 +949,7 @@ Matches are independent objects keyed by match_id; each BRIDGING match owns one 
 
 | Property                  | Mechanism                   | Notes                    |
 | ------------------------- | --------------------------- | ------------------------ |
-| Address unpredictability  | HMAC-SHA256 with secret key | 2^(128-P) addresses × ~2^16 ports per bucket within a known prefix (≈2^80 for a /64) |
+| Address unpredictability  | HMAC-SHA256 with secret key | 2^(128-P) addresses × ~2^16 ports per bucket within a known prefix (≈2^80 for a /64); scales with prefix size, see Section 11.8 |
 | Connection authentication | Noise IKpsk2                | Mutual authentication    |
 | Forward secrecy           | Ephemeral keys in Noise     | Per-session keys         |
 | Replay protection         | Timestamp + nonce, bound via Noise prologue | Header tampering breaks the handshake (Section 4.4) |
@@ -1018,6 +1018,34 @@ Implementations SHOULD implement rate limiting:
 4. **Metadata at broker**: Brokers observe connection graph and traffic patterns
 5. **No post-quantum security**: X25519 and current primitives are not quantum-resistant
 6. **Prefix stability**: Generated addresses depend on the responder's advertised routing prefix; renumbering (e.g., a new ISP-delegated prefix) requires updating reachability information out-of-band
+
+### 11.8 Prefix Size and Search Space
+
+Address generation (Section 6.3) fills the bits below the advertised prefix length P with HMAC-derived output, so the protocol operates within a routed prefix of **any** length; P is not required to be 64. The prefix length sets the size of the search space an unauthorized party faces and nothing else — correctness, authentication, and confidentiality are all independent of P.
+
+**Search target.** Because a conforming responder silently drops all traffic except its currently valid tuples (Section 11.5), an unauthorized party receives no distinguishing response until it addresses a packet to the *exact* live (address, port) tuple. The effective search target is therefore the whole tuple, not the address alone:
+
+```
+tuple entropy (bits) = (128 - P) address bits + log2(PORT_RANGE) port bits
+                     ≈ (128 - P) + 16
+```
+
+**Rotation bound.** Every valid tuple is replaced each BUCKET_DURATION (Section 6.1). Resistance to enumeration is therefore governed not by the absolute space size but by the space size *relative to the probe rate an attacker can sustain within one bucket*: to locate a live tuple the attacker must sweep the space in less than BUCKET_DURATION seconds, after which the target has moved and any partial progress is void.
+
+| Prefix P | Address bits | Tuple entropy | Tuple space | Sweep within one 300 s bucket |
+| -------- | ------------ | ------------- | ----------- | ----------------------------- |
+| /64  | 64 | ~80 | ~1.2×10^24 | infeasible                         |
+| /80  | 48 | ~64 | ~1.8×10^19 | infeasible                         |
+| /96  | 32 | ~48 | ~2.8×10^14 | infeasible (~10^12 packets/s)      |
+| /112 | 16 | ~32 | ~4.3×10^9  | ~1.4×10^7 packets/s — high-rate but feasible |
+| /120 |  8 | ~24 | ~1.7×10^7  | ~5.6×10^4 packets/s — trivial      |
+| /128 |  0 | ~16 | ~6.5×10^4  | instant (address fixed, only the port rotates) |
+
+At P = 128 the address is fixed and only the port rotates; the scheme retains no address-level concealment and degrades to a single well-known address with a moving port.
+
+**Graceful degradation.** A longer prefix (fewer host bits) weakens only the *concealment* and *unlinkability* of the address stream (the "Address unpredictability" property of Section 11.2) — the ability to keep the service unenumerable and successive connections uncorrelated. It does **not** weaken confidentiality or authentication: an attacker who enumerates a small prefix and reaches a live tuple still faces the Noise IKpsk2 handshake and gains nothing without the peer static key and the handshake password (Section 8.2). The address scheme is a concealment layer over an independently sound cryptographic layer, so it fails soft rather than catastrophically.
+
+**Guidance.** Responders SHOULD advertise the routed prefix that leaves the most host bits available to them (the shortest prefix length / largest address block that actually routes to the host). A prefix length of /96 or shorter (at least ~32 host bits) keeps single-bucket enumeration infeasible even for a well-resourced attacker; /64 — a typical delegated segment — provides a wide margin. Longer prefixes remain correct and fully functional but provide progressively weaker concealment, and SHOULD be limited to deployments where enumeration of the responder's prefix is outside the threat model, or where the reduced address space is compensated by additional network-layer filtering and rate limiting (Section 11.6).
 
 ---
 
@@ -1381,6 +1409,7 @@ clarifications and added requirements; no wire formats or test vectors change.
 - §9.3: clarified that broker authorization MUST use the identities parties authenticated with in their Noise handshake to the broker, not values asserted in messages
 - §6.4: corrected the tolerance claim — the effective clock-skew tolerance is the intersection of the address window and the ±30s timestamp window (≈±30s), not ±5 minutes (from independent review)
 - §8.2, §9.5: noted that the TCP FIN carrying end-of-stream is not authenticated, so an on-path attacker or the broker can truncate the stream undetectably (from independent review)
+- §11.8 (new): documented the prefix-size / search-space tradeoff — the protocol works within a routed prefix of any length P, with tuple entropy ≈ (128−P) + 16 bits and enumeration resistance governed by space-per-bucket vs. attacker probe rate; a smaller prefix degrades concealment/unlinkability only, not confidentiality or authentication (§5.4, §6.3 cross-referenced)
 
 ### Version 0.3.0-draft (July 2026)
 
