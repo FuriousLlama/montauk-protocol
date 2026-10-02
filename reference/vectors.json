@@ -1,0 +1,144 @@
+{
+  "generated_by": [
+    "reference/vectors_address.py",
+    "reference/vectors_handshake.py"
+  ],
+  "license": "CC0-1.0",
+  "spec_version": "0.4.0-draft",
+  "vectors": {
+    "address_generation": {
+      "cases": [
+        {
+          "T": 5687652,
+          "ipv6_address": "2001:db8:1234:5678:9045:c6c4:d54a:135a",
+          "label": "A (/64)",
+          "name": "A",
+          "port": 30845,
+          "port_raw": 29821,
+          "prefix": "2001:db8:1234:5678::/64",
+          "raw": "c2ffd88025566ce59045c6c4d54a135a747d431efdb1f3effcdb66edf3fc9958",
+          "timestamp": 1706295600
+        },
+        {
+          "T": 5687652,
+          "ipv6_address": "2001:db8:1234:5678:9abc:c6c4:d54a:135a",
+          "label": "B (/80)",
+          "name": "B",
+          "port": 30845,
+          "port_raw": 29821,
+          "prefix": "2001:db8:1234:5678:9abc::/80",
+          "raw": "c2ffd88025566ce59045c6c4d54a135a747d431efdb1f3effcdb66edf3fc9958",
+          "timestamp": 1706295600
+        },
+        {
+          "T": 5687738,
+          "ipv6_address": "2001:db8:1234:5678:a213:fa43:dec4:679f",
+          "label": "C (port modulo)",
+          "name": "C",
+          "port": 1281,
+          "port_raw": 64768,
+          "prefix": "2001:db8:1234:5678::/64",
+          "raw": "b343b4d7e9c46f4da213fa43dec4679ffd007be8fe3878829b3115c59d1ae66a",
+          "timestamp": 1706321400
+        }
+      ],
+      "common": {
+        "responder_pubkey": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "service_id": "0f0e0d0c0b0a09080706050403020100",
+        "session_key": "cf9dfe21bf2617837c0c50d8bb14555e45e3d2023cedea4ce2ce0bfb48dde05e"
+      },
+      "section": "13.4"
+    },
+    "first_packet": {
+      "inputs": {
+        "nonce": "000102030405060708090a0b0c0d0e0f",
+        "payload": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285fb7983d2f78e86e68627ad14f8e48a8dc563c3b7bdc8ed9820f59e762fdbb7c40e5ce5d480fd4778873a7192808890d9e1b578ab8fbd911ff05935702900a9e14",
+        "timestamp": 1706295600,
+        "version": 1
+      },
+      "outputs": {
+        "frame_body": "010000000065b40130000102030405060708090a0b0c0d0e0f8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285fb7983d2f78e86e68627ad14f8e48a8dc563c3b7bdc8ed9820f59e762fdbb7c40e5ce5d480fd4778873a7192808890d9e1b578ab8fbd911ff05935702900a9e14",
+        "noise_prologue": "010000000065b40130000102030405060708090a0b0c0d0e0f",
+        "wire_format": "0079010000000065b40130000102030405060708090a0b0c0d0e0f8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285fb7983d2f78e86e68627ad14f8e48a8dc563c3b7bdc8ed9820f59e762fdbb7c40e5ce5d480fd4778873a7192808890d9e1b578ab8fbd911ff05935702900a9e14"
+      },
+      "section": "13.5"
+    },
+    "handshake_brokered": {
+      "inputs": {
+        "init_ephemeral": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "init_static": "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+        "msg1_payload": "0f0e0d0c0b0a09080706050403020100",
+        "msg2_payload": "",
+        "prologue": "010000000065b40130101112131415161718191a1b1c1d1e1f",
+        "psk": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+        "resp_ephemeral": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+        "resp_ephemeral_pub": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a",
+        "resp_static": "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"
+      },
+      "outputs": {
+        "handshake_hash": "9bf3604eac6ba2dc2b090db8eeb80efa39b6b0d6e5994692452117d09a39d8d8",
+        "message_1": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285fb7983d2f78e86e68627ad14f8e48a8dc563c3b7bdc8ed9820f59e762fdbb7c40c920351fb82ad24da835fad0ec39f92fa38477b0ebadb6c798dfc16e5a115540548ad38e5570b509e29877dbe4513124",
+        "message_2": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a5e04cf6f6ad1a2a344bd386c030ab9ec"
+      },
+      "section": "13.7"
+    },
+    "handshake_direct": {
+      "inputs": {
+        "init_ephemeral": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "init_static": "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+        "msg1_payload": "",
+        "msg2_payload": "",
+        "prologue": "010000000065b40130000102030405060708090a0b0c0d0e0f",
+        "psk": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+        "resp_ephemeral": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+        "resp_ephemeral_pub": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51a",
+        "resp_static": "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"
+      },
+      "outputs": {
+        "handshake_hash": "a4d854c2aebc7e23f8248cbcc402d5a71f8537718673ee9e26b05abe6965cdde",
+        "message_1": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285fb7983d2f78e86e68627ad14f8e48a8dc563c3b7bdc8ed9820f59e762fdbb7c40e5ce5d480fd4778873a7192808890d9e1b578ab8fbd911ff05935702900a9e14",
+        "message_2": "79a631eede1bf9c98f12032cdeadd0e7a079398fc786b88cc846ec89af85a51af689e44f383a6d2cf4fefbb9f157e382",
+        "transport_1": {
+          "ciphertext": "892a5643ce98792bc9f31eda2a98ebb113c206e3",
+          "plaintext": "70696e67"
+        },
+        "transport_2": {
+          "ciphertext": "e2bf3db33c5f6e1bac085257600486632a256ba2",
+          "plaintext": "706f6e67"
+        }
+      },
+      "section": "13.6"
+    },
+    "key_generation": {
+      "inputs": {
+        "private_key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+      },
+      "outputs": {
+        "public_key": "8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f"
+      },
+      "section": "13.1"
+    },
+    "session_key": {
+      "inputs": {
+        "prior": "deadbeefcafebabe0123456789abcdeffedcba9876543210baadf00ddeadbeef",
+        "shared_secret": "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+      },
+      "outputs": {
+        "session_key": "cf9dfe21bf2617837c0c50d8bb14555e45e3d2023cedea4ce2ce0bfb48dde05e"
+      },
+      "section": "13.3"
+    },
+    "shared_secret": {
+      "inputs": {
+        "alice_private": "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+        "alice_public": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "bob_private": "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+        "bob_public": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"
+      },
+      "outputs": {
+        "shared_secret": "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+      },
+      "section": "13.2"
+    }
+  }
+}
