@@ -1,7 +1,7 @@
 [project]
 name = "montauk"
 version = "0.0.1"
-description = "Reference implementation of the Montauk Protocol (spec v0.3.0-draft)"
+description = "Reference implementation of the Montauk Protocol (spec v0.4.0-draft)"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
