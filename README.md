@@ -4,6 +4,18 @@ The protocol allows for the exchange of information by allowing two parties to s
 
 Using a Prior, two agents compute a valid location for exchanging communication while making it highly unlikely to be 'guessed' by chance.
 
+# Status
+
+- **Specification:** v0.4.0-draft. Folds in the findings from building and
+  validating the reference implementation; no wire formats or test vectors
+  changed since v0.3.0 (see Appendix C of the spec).
+- **Reference implementation:** v1 complete (milestones M0–M5). Direct and
+  brokered connections, live address rotation, and the nftables firewall were
+  validated cross-host on an isolated IPv6 testbed. 66 tests, all green.
+- **Review:** an independent adversarial review of the spec against the
+  implementation and a line-by-line §12.1 conformance audit are recorded in
+  the roadmap; every finding is fixed or documented.
+
 # Specification
 
 The specification is stored in [montauk spec](montauk_spec.md).
@@ -16,13 +28,19 @@ in [reference/](reference/).
 
 # Reference Implementation
 
-The roadmap for the reference implementation — architecture, milestones,
-testing strategy, and the running spec-feedback log — is in
-[docs/reference_roadmap.md](docs/reference_roadmap.md).
+The Python reference implementation lives in [impl/](impl/), with its own
+[README](impl/README.md) covering the `montauk` CLI, layout, and loopback
+testing.
+
+- [docs/reference_roadmap.md](docs/reference_roadmap.md) — architecture,
+  milestones, the spec-feedback log, the independent review, and the §12.1
+  conformance audit.
+- [docs/deployment.md](docs/deployment.md) — deploying a responder, initiator,
+  and broker on real hosts (AnyIP, `IPV6_FREEBIND`, nftables).
 
 # License
 
-- **Code** (`reference/`, future implementation directories): copyright 2026
+- **Code** (`reference/`, `impl/`): copyright 2026
   Manuel Rodriguez, licensed under the [Apache License 2.0](LICENSE).
 - **Specification text** (`montauk_spec.md`, `docs/`):
   [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
